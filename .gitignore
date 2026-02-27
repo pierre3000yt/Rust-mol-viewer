@@ -36,3 +36,12 @@ Cargo.lock
 *.mp4
 *.png
 screenshots/
+
+# PDB/CIF data files (large, not code)
+*.cif
+*.xtc
+*.dcd
+*.trr
+
+# Claude Code session files
+.claude/

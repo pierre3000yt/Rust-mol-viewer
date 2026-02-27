@@ -1,6 +1,6 @@
 use crate::benchmark::{BenchmarkStats, BenchmarkTimer};
 use crate::camera::Camera;
-use crate::representations::{BallStickRenderer, BillboardRenderer, RepresentationType, SpheresRenderer, RibbonRenderer, SurfaceRenderer};
+use crate::representations::{AxesRenderer, BallStickRenderer, BillboardRenderer, RepresentationType, SpheresRenderer, RibbonRenderer, SurfaceRenderer, SurfaceRaymarchRenderer, SphereRaymarchRenderer, RaymarchConfig};
 use crate::representations::spheres::SphereInstance;
 use crate::representations::billboards::BillboardInstance;
 use crate::lod::{LodSystem, LodGroups, LodLevel};
@@ -87,6 +87,9 @@ pub struct Renderer {
     pub ball_stick_renderer: Option<BallStickRenderer>,
     pub ribbon_renderer: Option<RibbonRenderer>,
     pub surface_renderer: Option<SurfaceRenderer>,
+    pub surface_raymarch_renderer: Option<SurfaceRaymarchRenderer>,
+    pub sphere_raymarch_renderer: Option<SphereRaymarchRenderer>,
+    pub axes_renderer: AxesRenderer,
 
     // Multi-LOD sphere renderers (CPU path)
     spheres_high: SpheresRenderer,      // subdivision 3 (512 tris)
@@ -135,6 +138,14 @@ pub struct Renderer {
     ball_stick_loaded: bool,
     ribbon_loaded: bool,
     surface_loaded: bool,
+    surface_raymarch_loaded: bool,
+    sphere_raymarch_loaded: bool,
+    // Track which protein (by atom count) was used to generate each geometry
+    ball_stick_atom_count: usize,
+    ribbon_atom_count: usize,
+    surface_atom_count: usize,
+    surface_raymarch_atom_count: usize,
+    sphere_raymarch_atom_count: usize,
 
     // Benchmarking stats
     pub benchmark_stats: BenchmarkStats,
@@ -265,6 +276,10 @@ impl Renderer {
         let spheres_renderer =
             SpheresRenderer::new(&device, surface_format, &camera_bind_group_layout);
 
+        // Create axes renderer for coordinate system visualization
+        let axes_renderer =
+            AxesRenderer::new(&device, surface_format, &camera_bind_group_layout, 50.0);
+
         // Ball-stick, ribbon, and surface renderers will be lazy-loaded when first needed
         // This significantly speeds up startup time
 
@@ -320,6 +335,9 @@ impl Renderer {
             ball_stick_renderer: None,  // Lazy-loaded
             ribbon_renderer: None,      // Lazy-loaded
             surface_renderer: None,     // Lazy-loaded
+            surface_raymarch_renderer: None, // Lazy-loaded
+            sphere_raymarch_renderer: None,  // Lazy-loaded
+            axes_renderer,
             spheres_high,
             spheres_medium,
             spheres_low,
@@ -350,6 +368,13 @@ impl Renderer {
             ball_stick_loaded: false,
             ribbon_loaded: false,
             surface_loaded: false,
+            surface_raymarch_loaded: false,
+            sphere_raymarch_loaded: false,
+            ball_stick_atom_count: 0,
+            ribbon_atom_count: 0,
+            surface_atom_count: 0,
+            surface_raymarch_atom_count: 0,
+            sphere_raymarch_atom_count: 0,
 
             benchmark_stats: BenchmarkStats::new(),
 
@@ -968,6 +993,12 @@ impl Renderer {
     }
 
     pub fn load_protein(&mut self, protein: &pdb_parser::Protein) {
+        // Skip if protein is already loaded (same atom count)
+        // This prevents per-frame re-initialization in the render loop
+        if protein.atoms.len() == self.atom_count && self.atom_count > 0 {
+            return;
+        }
+
         log::info!("Loading protein with {} atoms", protein.atoms.len());
 
         // Generate sphere instances for Van der Waals
@@ -990,14 +1021,17 @@ impl Renderer {
         // They will be generated when the user switches to those representation modes
         // This significantly speeds up protein loading
 
-        // Center camera on protein
-        self.camera.look_at(protein.center());
-        let (min, max): (Vec3, Vec3) = protein.bounding_box();
-        let size = (max - min).length();
-        self.camera.position = protein.center() + Vec3::new(0.0, 0.0, size * 1.5);
+        // NOTE: Camera positioning is now handled by the App layer (focus_on_model, frame_all, etc.)
+        // We don't auto-center the camera here to allow multi-model rendering without camera jumps
 
         // Initialize GPU compute buffers if available
         self.init_compute_buffers(protein);
+
+        // Update atom_count to track which protein is loaded
+        self.atom_count = protein.atoms.len();
+
+        let (min, max): (Vec3, Vec3) = protein.bounding_box();
+        let size = (max - min).length();
 
         log::info!("Protein loaded successfully");
         log::info!("  Center: {:?}", protein.center());
@@ -1103,10 +1137,17 @@ impl Renderer {
 
     /// Ensure ball-stick renderer is created and has data
     pub fn ensure_ball_stick(&mut self, protein: &pdb_parser::Protein) {
-        // Check if already loaded
-        if self.ball_stick_loaded {
-            log::debug!("Ball-stick geometry already loaded, skipping regeneration");
+        // Check if already loaded for THIS protein (by atom count)
+        let current_atom_count = protein.atoms.len();
+        if self.ball_stick_loaded && self.ball_stick_atom_count == current_atom_count {
+            log::debug!("Ball-stick geometry already loaded for this protein, skipping regeneration");
             return;
+        }
+
+        // If loaded but for different protein, log that we're regenerating
+        if self.ball_stick_loaded && self.ball_stick_atom_count != current_atom_count {
+            log::info!("Ball-stick geometry loaded for different protein ({} atoms), regenerating for {} atoms",
+                self.ball_stick_atom_count, current_atom_count);
         }
 
         // Create renderer if needed
@@ -1156,15 +1197,23 @@ impl Renderer {
         }
 
         self.ball_stick_loaded = true;
+        self.ball_stick_atom_count = protein.atoms.len();
         log::info!("Ball-stick geometry ready: {} atoms, {} bonds", ball_instances.len(), cylinder_instances.len());
     }
 
     /// Ensure ribbon renderer is created and has data
     pub fn ensure_ribbon(&mut self, protein: &pdb_parser::Protein) {
-        // Check if already loaded
-        if self.ribbon_loaded {
-            log::debug!("Ribbon geometry already loaded, skipping regeneration");
+        // Check if already loaded for THIS protein (by atom count)
+        let current_atom_count = protein.atoms.len();
+        if self.ribbon_loaded && self.ribbon_atom_count == current_atom_count {
+            log::debug!("Ribbon geometry already loaded for this protein, skipping regeneration");
             return;
+        }
+
+        // If loaded but for different protein, log that we're regenerating
+        if self.ribbon_loaded && self.ribbon_atom_count != current_atom_count {
+            log::info!("Ribbon geometry loaded for different protein ({} atoms), regenerating for {} atoms",
+                self.ribbon_atom_count, current_atom_count);
         }
 
         // Create renderer if needed
@@ -1184,6 +1233,7 @@ impl Renderer {
                 log::error!("Failed to generate ribbon: {}", e);
             } else {
                 self.ribbon_loaded = true;
+                self.ribbon_atom_count = protein.atoms.len();
                 log::info!("Ribbon geometry ready");
             }
         }
@@ -1191,10 +1241,17 @@ impl Renderer {
 
     /// Ensure surface renderer is created and has data
     pub fn ensure_surface(&mut self, protein: &pdb_parser::Protein) {
-        // Check if already loaded
-        if self.surface_loaded {
-            log::debug!("Surface geometry already loaded, skipping regeneration");
+        // Check if already loaded for THIS protein (by atom count)
+        let current_atom_count = protein.atoms.len();
+        if self.surface_loaded && self.surface_atom_count == current_atom_count {
+            log::debug!("Surface geometry already loaded for this protein, skipping regeneration");
             return;
+        }
+
+        // If loaded but for different protein, log that we're regenerating
+        if self.surface_loaded && self.surface_atom_count != current_atom_count {
+            log::info!("Surface geometry loaded for different protein ({} atoms), regenerating for {} atoms",
+                self.surface_atom_count, current_atom_count);
         }
 
         // Create renderer if needed
@@ -1217,7 +1274,84 @@ impl Renderer {
                 log::error!("Failed to generate surface: {}", e);
             } else {
                 self.surface_loaded = true;
+                self.surface_atom_count = protein.atoms.len();
                 log::info!("Surface geometry ready");
+            }
+        }
+    }
+
+    /// Ensure raymarching surface renderer is created and has data
+    pub fn ensure_surface_raymarch(&mut self, protein: &pdb_parser::Protein) {
+        // Check if already loaded for THIS protein (by atom count)
+        let current_atom_count = protein.atoms.len();
+        if self.surface_raymarch_loaded && self.surface_raymarch_atom_count == current_atom_count {
+            log::debug!("Raymarching surface already loaded for this protein, skipping regeneration");
+            return;
+        }
+
+        // If loaded but for different protein, log that we're regenerating
+        if self.surface_raymarch_loaded && self.surface_raymarch_atom_count != current_atom_count {
+            log::info!("Raymarching surface loaded for different protein ({} atoms), regenerating for {} atoms",
+                self.surface_raymarch_atom_count, current_atom_count);
+        }
+
+        // Create renderer if needed
+        if self.surface_raymarch_renderer.is_none() {
+            log::info!("Creating raymarching surface renderer...");
+            self.surface_raymarch_renderer = Some(SurfaceRaymarchRenderer::new(
+                &self.device,
+                self.config.format,
+                &self.camera_bind_group_layout,
+            ));
+        }
+
+        // Prepare raymarching data (instant compared to marching cubes!)
+        log::info!("Preparing raymarching surface (instant preparation)...");
+        let raymarch_config = RaymarchConfig::default();
+
+        if let Some(ref mut renderer) = self.surface_raymarch_renderer {
+            if let Err(e) = renderer.prepare_surface(&self.device, &self.queue, protein, &raymarch_config) {
+                log::error!("Failed to prepare raymarching surface: {}", e);
+            } else {
+                self.surface_raymarch_loaded = true;
+                self.surface_raymarch_atom_count = protein.atoms.len();
+                log::info!("Raymarching surface ready (real-time rendering enabled)");
+            }
+        }
+    }
+
+    /// Ensure sphere raymarch renderer is created and has data
+    pub fn ensure_sphere_raymarch(&mut self, protein: &pdb_parser::Protein) {
+        let current_atom_count = protein.atoms.len();
+        if self.sphere_raymarch_loaded && self.sphere_raymarch_atom_count == current_atom_count {
+            log::debug!("Sphere raymarch already loaded for this protein, skipping regeneration");
+            return;
+        }
+
+        if self.sphere_raymarch_loaded && self.sphere_raymarch_atom_count != current_atom_count {
+            log::info!("Sphere raymarch loaded for different protein ({} atoms), regenerating for {} atoms",
+                self.sphere_raymarch_atom_count, current_atom_count);
+        }
+
+        if self.sphere_raymarch_renderer.is_none() {
+            log::info!("Creating sphere raymarch renderer...");
+            self.sphere_raymarch_renderer = Some(SphereRaymarchRenderer::new(
+                &self.device,
+                self.config.format,
+                &self.camera_bind_group_layout,
+            ));
+        }
+
+        log::info!("Preparing sphere raymarch ({} atoms)...", protein.atoms.len());
+        let cell_size = 8.0; // Grid cell size in Angstroms
+
+        if let Some(ref mut renderer) = self.sphere_raymarch_renderer {
+            if let Err(e) = renderer.prepare(&self.device, &self.queue, protein, cell_size) {
+                log::error!("Failed to prepare sphere raymarch: {}", e);
+            } else {
+                self.sphere_raymarch_loaded = true;
+                self.sphere_raymarch_atom_count = protein.atoms.len();
+                log::info!("Sphere raymarch ready (analytic ray-sphere intersection)");
             }
         }
     }
@@ -1585,6 +1719,34 @@ impl Renderer {
                         renderer.render(&mut render_pass);
                     }
                 }
+                RepresentationType::SurfaceRaymarch => {
+                    // Lazy-load raymarching surface renderer if needed
+                    if self.surface_raymarch_renderer.is_none() {
+                        log::info!("Lazy-loading raymarching surface renderer...");
+                        self.surface_raymarch_renderer = Some(SurfaceRaymarchRenderer::new(
+                            &self.device,
+                            self.config.format,
+                            &self.camera_bind_group_layout,
+                        ));
+                    }
+                    if let Some(ref renderer) = self.surface_raymarch_renderer {
+                        renderer.render(&mut render_pass);
+                    }
+                }
+                RepresentationType::SphereRaymarch => {
+                    // Lazy-load raymarched spheres renderer if needed
+                    if self.sphere_raymarch_renderer.is_none() {
+                        log::info!("Lazy-loading sphere raymarch renderer...");
+                        self.sphere_raymarch_renderer = Some(SphereRaymarchRenderer::new(
+                            &self.device,
+                            self.config.format,
+                            &self.camera_bind_group_layout,
+                        ));
+                    }
+                    if let Some(ref renderer) = self.sphere_raymarch_renderer {
+                        renderer.render(&mut render_pass);
+                    }
+                }
             }
         }
 
@@ -1592,5 +1754,45 @@ impl Renderer {
         output.present();
 
         Ok(())
+    }
+
+    /// Clear all GPU resources for loaded protein data
+    /// This is called when all models are removed from the scene
+    pub fn clear_protein_data(&mut self) {
+        log::info!("Clearing all protein data from renderer");
+
+        // Clear lazy-loaded renderers (these are Option types, so setting to None frees memory)
+        self.ball_stick_renderer = None;
+        self.ribbon_renderer = None;
+        self.surface_renderer = None;
+        self.surface_raymarch_renderer = None;
+        self.sphere_raymarch_renderer = None;
+
+        // Reset loaded flags
+        self.ball_stick_loaded = false;
+        self.ribbon_loaded = false;
+        self.surface_loaded = false;
+        self.surface_raymarch_loaded = false;
+        self.sphere_raymarch_loaded = false;
+
+        // Clear GPU compute buffers
+        self.atom_data_buffer = None;
+        self.frustum_buffer = None;
+        self.camera_position_buffer = None;
+        self.lod_config_buffer = None;
+        self.draw_commands_buffer = None;
+        self.visible_indices_buffers = None;
+        self.compute_bind_group = None;
+        self.gpu_render_bind_groups = None;
+
+        // Clear GPU-driven sphere renderers if they exist
+        self.gpu_spheres_high = None;
+        self.gpu_spheres_medium = None;
+        self.gpu_spheres_low = None;
+        self.gpu_spheres_very_low = None;
+
+        self.atom_count = 0;
+
+        log::info!("Protein data cleared successfully");
     }
 }

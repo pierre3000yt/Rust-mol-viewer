@@ -431,3 +431,113 @@ pub fn animation_panel(ctx: &Context, state: &mut UIState) {
             ui.label(format!("Time: {:.2} ns", time_ns));
         });
 }
+
+/// Models panel - shows list of loaded models with load/add/remove controls
+pub fn models_panel(ctx: &Context, state: &mut UIState) {
+    egui::SidePanel::left("models_panel")
+        .default_width(280.0)
+        .show(ctx, |ui| {
+            ui.heading("Models");
+            ui.separator();
+
+            // Load buttons
+            ui.horizontal(|ui| {
+                if ui.button("➕ Load (Add)").on_hover_text("Add a new model to the scene").clicked() {
+                    state.trigger_load_add = true;
+                }
+                if ui.button("📂 Load (Replace)").on_hover_text("Clear all models and load a new one").clicked() {
+                    state.trigger_load_replace = true;
+                }
+            });
+
+            ui.separator();
+
+            // Display options
+            ui.heading("Display");
+            ui.checkbox(&mut state.show_axes, "Show Axes");
+
+            if ui.button("🎯 Frame All").on_hover_text("Adjust camera to show all visible models").clicked() {
+                state.trigger_frame_all = true;
+            }
+
+            ui.separator();
+            ui.label(format!("Loaded: {} model(s)", state.models.len()));
+            ui.separator();
+
+            // Model list (scrollable)
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                let mut idx_to_remove: Option<usize> = None;
+
+                for (idx, model_info) in state.models.iter_mut().enumerate() {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            // Visibility checkbox
+                            ui.checkbox(&mut model_info.visible, "");
+
+                            // Model name (truncate if too long)
+                            let name = if model_info.name.len() > 25 {
+                                format!("{}...", &model_info.name[..22])
+                            } else {
+                                model_info.name.clone()
+                            };
+                            ui.label(name);
+
+                            // Spacer to push delete button to the right
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                // Delete button
+                                if ui.button("🗑").on_hover_text("Remove this model").clicked() {
+                                    idx_to_remove = Some(idx);
+                                }
+                            });
+                        });
+
+                        // Representation selector (per model)
+                        ui.horizontal(|ui| {
+                            ui.label("Rep:");
+                            ui.selectable_value(
+                                &mut model_info.representation,
+                                crate::RepresentationType::VanDerWaals,
+                                "VdW",
+                            );
+                            ui.selectable_value(
+                                &mut model_info.representation,
+                                crate::RepresentationType::BallStick,
+                                "Ball",
+                            );
+                            ui.selectable_value(
+                                &mut model_info.representation,
+                                crate::RepresentationType::Ribbon,
+                                "Ribbon",
+                            );
+                            ui.selectable_value(
+                                &mut model_info.representation,
+                                crate::RepresentationType::Surface,
+                                "Surf",
+                            );
+                        });
+
+                        // Stats
+                        ui.small(format!("{} atoms", format_number(model_info.atom_count)));
+                    });
+
+                    ui.add_space(5.0);
+                }
+
+                // Mark model for removal (done outside loop to avoid borrowing issues)
+                if let Some(idx) = idx_to_remove {
+                    if let Some(model) = state.models.get(idx) {
+                        state.model_to_remove = Some(model.id);
+                    }
+                }
+            });
+
+            // Info section at bottom
+            if !state.models.is_empty() {
+                ui.separator();
+                let total_atoms: usize = state.models.iter().map(|m| m.atom_count).sum();
+                let visible_models = state.models.iter().filter(|m| m.visible).count();
+                ui.small(format!("Visible: {} / {}", visible_models, state.models.len()));
+                ui.small(format!("Total atoms: {}", format_number(total_atoms)));
+            }
+        });
+}

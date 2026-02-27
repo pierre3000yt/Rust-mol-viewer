@@ -1,6 +1,10 @@
 struct CameraUniform {
     view_proj: mat4x4<f32>,
+    view: mat4x4<f32>,
+    proj: mat4x4<f32>,
+    inv_view_proj: mat4x4<f32>,
     view_pos: vec3<f32>,
+    _padding: f32,
 }
 
 struct BillboardInstance {

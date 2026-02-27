@@ -5,6 +5,9 @@ use glam::{Mat4, Vec2, Vec3, Vec4, Vec4Swizzles};
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct CameraUniform {
     pub view_proj: [[f32; 4]; 4],
+    pub view: [[f32; 4]; 4],
+    pub proj: [[f32; 4]; 4],
+    pub inv_view_proj: [[f32; 4]; 4], // Pre-computed inverse for raymarching
     pub view_pos: [f32; 3],
     pub _padding: f32,
 }
@@ -73,8 +76,12 @@ impl Camera {
     }
 
     pub fn uniform(&self) -> CameraUniform {
+        let view_proj = self.view_projection();
         CameraUniform {
-            view_proj: self.view_projection().to_cols_array_2d(),
+            view_proj: view_proj.to_cols_array_2d(),
+            view: self.view_matrix().to_cols_array_2d(),
+            proj: self.projection_matrix().to_cols_array_2d(),
+            inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             view_pos: self.position.into(),
             _padding: 0.0,
         }
@@ -257,8 +264,12 @@ impl Camera {
 
     /// Get camera uniform for stereo rendering
     pub fn uniform_stereo(&self, eye: Eye) -> CameraUniform {
+        let view_proj = self.view_projection_stereo(eye);
         CameraUniform {
-            view_proj: self.view_projection_stereo(eye).to_cols_array_2d(),
+            view_proj: view_proj.to_cols_array_2d(),
+            view: self.view_matrix_stereo(eye).to_cols_array_2d(),
+            proj: self.projection_matrix_stereo(eye).to_cols_array_2d(),
+            inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             view_pos: self.eye_position(eye).into(),
             _padding: 0.0,
         }

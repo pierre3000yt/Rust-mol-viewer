@@ -1,8 +1,11 @@
+mod model_manager;
+
 use anyhow::Result;
+use model_manager::ModelManager;
 use mol_render::{FpsCounter, Renderer, RepresentationType};
 use mol_ui::{AtomSelectionInfo, MolecularUI, UIState, RepresentationType as UIRepType};
 use mol_vr::openxr;
-use pdb_parser::{infer_bonds_optimized, parse_pdb_trajectory, Protein, Trajectory};
+use pdb_parser::{infer_bonds_optimized, parse_pdb_trajectory, Protein};
 use std::env;
 use std::sync::Arc;
 use std::time::Instant;
@@ -17,7 +20,8 @@ use winit::{
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
-    trajectory: Option<Trajectory>,
+    model_manager: ModelManager,
+    last_loaded_model_id: Option<usize>,
     protein_path: Option<String>,
 
     // VR mode flag
@@ -56,7 +60,8 @@ impl App {
         Self {
             window: None,
             renderer: None,
-            trajectory: None,
+            model_manager: ModelManager::new(),
+            last_loaded_model_id: None,
             protein_path,
             vr_mode,
             prev_right_grip: false,
@@ -129,7 +134,7 @@ impl App {
         }
     }
 
-    fn load_protein_file(&mut self, path: &str) -> Result<()> {
+    fn load_protein_file(&mut self, path: &str) -> Result<usize> {
         log::info!("Loading PDB file: {}", path);
 
         let mut trajectory = parse_pdb_trajectory(path)?;
@@ -150,62 +155,239 @@ impl App {
         let bonds = infer_bonds_optimized(&trajectory.topology, 3.0); // 3.0 Angstrom max search radius
         trajectory.topology.bonds = bonds;
 
-        // Update UI state with protein info
-        self.ui_state.protein_name = std::path::Path::new(path)
+        // Center the model at origin for consistent rendering across all representations
+        let center = trajectory.topology.center();
+        let offset = -center;
+        log::info!("Centering model at origin. Current center: {:?}, offset: {:?}", center, offset);
+
+        // Translate all atoms
+        for atom in &mut trajectory.topology.atoms {
+            atom.position += offset;
+        }
+
+        // Also translate positions in all frames if animated
+        for frame in &mut trajectory.frames {
+            for pos in &mut frame.coords {
+                *pos += offset;
+            }
+        }
+
+        log::info!("Model centered. New center: {:?}", trajectory.topology.center());
+
+        // Extract model name from file path
+        let name = std::path::Path::new(path)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("Unknown")
             .to_string();
-        self.ui_state.atom_count = trajectory.topology.atoms.len();
-        self.ui_state.chain_count = trajectory.topology.chains.len();
-        self.ui_state.helix_count = trajectory.topology.secondary_structure.helices.len();
-        self.ui_state.sheet_count = trajectory.topology.secondary_structure.sheets.len();
 
-        // Update animation state
-        self.ui_state.is_animated = trajectory.is_animated();
-        self.ui_state.total_frames = trajectory.frame_count();
-        self.ui_state.current_frame = 0;
-        self.ui_state.playing = false;
+        let atom_count = trajectory.topology.atoms.len();
 
-        if trajectory.is_animated() {
-            log::info!("  Animation detected with {} frames", trajectory.frame_count());
+        // Add model to manager
+        let model_id = self.model_manager.add_model(
+            name.clone(),
+            path.to_string(),
+            trajectory,
+        );
+
+        // Sync with UI state - add to models list
+        self.ui_state.models.push(mol_ui::ModelInfo {
+            id: model_id,
+            name: name.clone(),
+            visible: true,
+            representation: mol_ui::RepresentationType::VanDerWaals,
+            atom_count,
+        });
+
+        // Update UI state (only for first model or when replacing)
+        if self.model_manager.model_count() == 1 {
+            let model = self.model_manager.get_model(model_id).unwrap();
+            self.ui_state.protein_name = name.clone();
+            self.ui_state.atom_count = model.trajectory.topology.atoms.len();
+            self.ui_state.chain_count = model.trajectory.topology.chains.len();
+            self.ui_state.helix_count = model.trajectory.topology.secondary_structure.helices.len();
+            self.ui_state.sheet_count = model.trajectory.topology.secondary_structure.sheets.len();
+
+            // Update animation state
+            self.ui_state.is_animated = model.trajectory.is_animated();
+            self.ui_state.total_frames = model.trajectory.frame_count();
+            self.ui_state.current_frame = 0;
+            self.ui_state.playing = false;
+
+            if model.trajectory.is_animated() {
+                log::info!("  Animation detected with {} frames", model.trajectory.frame_count());
+            }
         }
 
-        self.trajectory = Some(trajectory);
+        log::info!("Model loaded with ID: {}", model_id);
 
-        Ok(())
+        Ok(model_id)
+    }
+
+    /// Open native file dialog to select a PDB file
+    fn open_file_dialog(&mut self, replace_all: bool) {
+        use rfd::FileDialog;
+
+        log::info!("Opening file dialog (replace_all: {})", replace_all);
+
+        if let Some(file) = FileDialog::new()
+            .add_filter("PDB Files", &["pdb", "ent", "cif"])
+            .set_title("Open PDB File")
+            .pick_file()
+        {
+            let path = file.to_string_lossy().to_string();
+            log::info!("User selected file: {}", path);
+            self.handle_file_selected(path, replace_all);
+        } else {
+            log::info!("File dialog cancelled");
+        }
+    }
+
+    /// Handle a file being selected from the dialog
+    fn handle_file_selected(&mut self, path: String, replace_all: bool) {
+        let was_empty = self.model_manager.is_empty();
+
+        if replace_all {
+            log::info!("Clearing all models before loading new one");
+            self.model_manager.clear_all();
+            self.ui_state.models.clear();
+        }
+
+        match self.load_protein_file(&path) {
+            Ok(model_id) => {
+                log::info!("Successfully loaded model with ID: {}", model_id);
+
+                // Only auto-focus camera if:
+                // 1. This is the first model being loaded (was_empty), OR
+                // 2. We're in replace mode (replace_all)
+                // In Add mode with existing models, keep the current camera view
+                if was_empty || replace_all {
+                    self.focus_on_model(model_id);
+                } else {
+                    log::info!("Model added to scene - camera position maintained");
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to load PDB file: {}", e);
+                // TODO: Show error message in UI
+            }
+        }
+    }
+
+    /// Remove a model from the scene
+    fn remove_model(&mut self, id: usize) {
+        if let Some(model) = self.model_manager.remove_model(id) {
+            log::info!("Removed model: {} (ID: {})", model.name, model.id);
+
+            // Remove from UI state
+            self.ui_state.models.retain(|m| m.id != id);
+
+            // If no models left, clear renderer data
+            if self.model_manager.is_empty() {
+                if let Some(ref mut _renderer) = self.renderer {
+                    // Clear renderer data - note: for now we just log
+                    // In a full implementation, we would call renderer.clear_protein_data()
+                    // but this creates borrowing complexity with the current architecture
+                    log::info!("All models removed");
+                }
+            }
+        }
+    }
+
+    /// Focus camera on a specific model
+    fn focus_on_model(&mut self, id: usize) {
+        if let Some(model) = self.model_manager.get_model(id) {
+            let protein = &model.trajectory.topology;
+
+            // Calculate center and size
+            let center = protein.center();
+            let (min, max) = protein.bounding_box();
+            let size = (max - min).length();
+
+            // Position camera
+            if let Some(ref mut renderer) = self.renderer {
+                renderer.camera.look_at(center);
+                renderer.camera.position = center + glam::Vec3::new(0.0, 0.0, size * 1.5);
+                log::info!("Camera focused on model {} at center {:?}", id, center);
+            }
+        }
+    }
+
+    /// Frame all visible models in camera view
+    fn frame_all_models(&mut self) {
+        let visible_models: Vec<_> = self.model_manager.visible_models().collect();
+
+        if visible_models.is_empty() {
+            log::warn!("No visible models to frame");
+            return;
+        }
+
+        // Calculate combined bounding box of all visible models
+        let mut global_min = glam::Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+        let mut global_max = glam::Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+
+        for model in &visible_models {
+            let (min, max) = model.trajectory.topology.bounding_box();
+            global_min = global_min.min(min);
+            global_max = global_max.max(max);
+        }
+
+        let center = (global_min + global_max) * 0.5;
+        let size = (global_max - global_min).length();
+
+        // Position camera to view all models
+        if let Some(ref mut renderer) = self.renderer {
+            renderer.camera.look_at(center);
+            renderer.camera.position = center + glam::Vec3::new(0.0, 0.0, size * 1.5);
+            log::info!("Camera framed {} visible models. Center: {:?}, Size: {:.2}",
+                visible_models.len(), center, size);
+        }
     }
 
     /// Handle a selection click at the given screen coordinates
     fn handle_selection_click(&mut self, screen_x: f32, screen_y: f32) {
-        let (renderer, protein) = match (&self.renderer, &self.trajectory) {
-            (Some(r), Some(t)) => (r, &t.topology),
-            _ => return,
-        };
+        // First, determine the clicked atom (immutable borrow scope)
+        let selection_result = {
+            let (renderer, protein) = match (&self.renderer, self.model_manager.visible_models().next().map(|m| &m.trajectory)) {
+                (Some(r), Some(t)) => (r, &t.topology),
+                _ => return,
+            };
 
-        let window_size = match &self.window {
-            Some(w) => w.inner_size(),
-            None => return,
-        };
+            let window_size = match &self.window {
+                Some(w) => w.inner_size(),
+                None => return,
+            };
 
-        // Generate ray from screen coordinates
-        let ray = renderer.camera.screen_to_ray(
-            screen_x,
-            screen_y,
-            window_size.width as f32,
-            window_size.height as f32,
-        );
-
-        // Find the atom at the clicked position
-        if let Some(atom_idx) = Self::pick_atom(&ray, protein, renderer) {
-            log::info!(
-                "Selected atom {}: {} ({})",
-                atom_idx,
-                protein.atoms[atom_idx].name,
-                protein.atoms[atom_idx].residue.name
+            // Generate ray from screen coordinates
+            let ray = renderer.camera.screen_to_ray(
+                screen_x,
+                screen_y,
+                window_size.width as f32,
+                window_size.height as f32,
             );
 
-            // Update selection based on mode
+            // Find the atom at the clicked position
+            if let Some(atom_idx) = Self::pick_atom(&ray, protein, renderer) {
+                log::info!(
+                    "Selected atom {}: {} ({})",
+                    atom_idx,
+                    protein.atoms[atom_idx].name,
+                    protein.atoms[atom_idx].residue.name
+                );
+
+                // Return the atom info and selection mode
+                Some((
+                    atom_idx,
+                    mol_ui::AtomSelectionInfo::from_atom(&protein.atoms[atom_idx], atom_idx),
+                    protein.clone(), // Clone protein for later use (TODO: optimize)
+                ))
+            } else {
+                None
+            }
+        };
+
+        // Now update selection (mutable borrow scope)
+        if let Some((atom_idx, atom_info, protein)) = selection_result {
             let selection_mode = self.ui_state.selection_mode;
             match selection_mode {
                 mol_ui::SelectionMode::Single => {
@@ -221,16 +403,15 @@ impl App {
                     }
                 }
                 mol_ui::SelectionMode::Residue => {
-                    Self::select_residue_atoms(protein, atom_idx, &mut self.ui_state.selected_atoms);
+                    Self::select_residue_atoms(&protein, atom_idx, &mut self.ui_state.selected_atoms);
                 }
                 mol_ui::SelectionMode::Chain => {
-                    Self::select_chain_atoms(protein, atom_idx, &mut self.ui_state.selected_atoms);
+                    Self::select_chain_atoms(&protein, atom_idx, &mut self.ui_state.selected_atoms);
                 }
             }
 
             // Update selection info for UI display
-            self.ui_state.selection_info =
-                Some(mol_ui::AtomSelectionInfo::from_atom(&protein.atoms[atom_idx], atom_idx));
+            self.ui_state.selection_info = Some(atom_info);
         } else {
             // Clicked empty space - clear selection
             self.ui_state.selected_atoms.clear();
@@ -269,6 +450,8 @@ impl App {
                 RepresentationType::BallAndStick => 0.3,
                 RepresentationType::Ribbon => 0.5, // Picking on C-alpha atoms
                 RepresentationType::Surface => 0.5,
+                RepresentationType::SurfaceRaymarch => 0.5,
+                RepresentationType::SphereRaymarch => atom.element.vdw_radius(),
             };
 
             // Test ray-sphere intersection
@@ -346,8 +529,13 @@ impl ApplicationHandler for App {
 
             // Load PDB file if provided
             if let Some(path) = self.protein_path.clone() {
-                if let Err(e) = self.load_protein_file(&path) {
-                    log::error!("Failed to load PDB file: {}", e);
+                match self.load_protein_file(&path) {
+                    Ok(model_id) => {
+                        log::info!("Initial model loaded with ID: {}", model_id);
+                    }
+                    Err(e) => {
+                        log::error!("Failed to load PDB file: {}", e);
+                    }
                 }
             } else {
                 log::info!("No PDB file provided.");
@@ -358,9 +546,9 @@ impl ApplicationHandler for App {
             let mut renderer = pollster::block_on(Renderer::new(window.clone()))
                 .expect("Failed to initialize renderer");
 
-            // If trajectory loaded, send it to renderer
-            if let Some(ref trajectory) = self.trajectory {
-                renderer.load_protein(&trajectory.topology);
+            // Load first visible model into renderer
+            if let Some(model) = self.model_manager.visible_models().next() {
+                renderer.load_protein(&model.trajectory.topology);
             }
 
             // Initialize egui
@@ -438,6 +626,7 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
+                log::debug!("Key pressed: {:?}", key_code);
                 if let Some(renderer) = &mut self.renderer {
                     match key_code {
                         KeyCode::Digit1 => {
@@ -472,9 +661,25 @@ impl ApplicationHandler for App {
                                 log::info!("Switched to Surface representation");
                             }
                         }
+                        KeyCode::Digit5 => {
+                            if renderer.representation != RepresentationType::SurfaceRaymarch {
+                                renderer.representation = RepresentationType::SurfaceRaymarch;
+                                self.ui_state.representation = UIRepType::SurfaceRaymarch;
+                                self.ui_state.representation_changed = true;
+                                log::info!("Switched to Raymarching Surface representation");
+                            }
+                        }
+                        KeyCode::Digit6 => {
+                            if renderer.representation != RepresentationType::SphereRaymarch {
+                                renderer.representation = RepresentationType::SphereRaymarch;
+                                self.ui_state.representation = UIRepType::SphereRaymarch;
+                                self.ui_state.representation_changed = true;
+                                log::info!("Switched to Spheres Realtime representation");
+                            }
+                        }
                         KeyCode::KeyR => {
                             // Reset camera
-                            if let Some(ref trajectory) = self.trajectory {
+                            if let Some(ref trajectory) = self.model_manager.visible_models().next().map(|m| &m.trajectory) {
                                 let protein = &trajectory.topology;
                                 renderer.camera.look_at(protein.center());
                                 let (min, max) = protein.bounding_box();
@@ -486,13 +691,13 @@ impl ApplicationHandler for App {
                         }
                         KeyCode::KeyU => {
                             // Toggle UI panels
-                            self.molecular_ui.show_controls = !self.molecular_ui.show_controls;
+                            self.molecular_ui.show_models = !self.molecular_ui.show_models;
                             self.molecular_ui.show_info = !self.molecular_ui.show_info;
-                            log::info!("UI panels {}", if self.molecular_ui.show_controls { "enabled" } else { "disabled" });
+                            log::info!("UI panels {}", if self.molecular_ui.show_info { "enabled" } else { "disabled" });
                         }
                         KeyCode::KeyA if self.ctrl_pressed => {
                             // Select all atoms (Ctrl+A)
-                            if let Some(ref trajectory) = self.trajectory {
+                            if let Some(ref trajectory) = self.model_manager.visible_models().next().map(|m| &m.trajectory) {
                                 let protein = &trajectory.topology;
                                 self.ui_state.selected_atoms = (0..protein.atoms.len()).collect();
                                 log::info!("Selected all {} atoms", protein.atoms.len());
@@ -548,6 +753,43 @@ impl ApplicationHandler for App {
                 // Update FPS counter
                 self.fps_counter.tick();
 
+                // Handle file dialog triggers BEFORE borrowing renderer
+                if self.ui_state.trigger_load_add {
+                    self.ui_state.trigger_load_add = false;
+                    self.open_file_dialog(false); // Add to scene
+                }
+
+                if self.ui_state.trigger_load_replace {
+                    self.ui_state.trigger_load_replace = false;
+                    self.open_file_dialog(true); // Replace all
+                }
+
+                // Handle model removal
+                if let Some(model_id) = self.ui_state.model_to_remove.take() {
+                    self.remove_model(model_id);
+                }
+
+                // Handle frame all visible models
+                if self.ui_state.trigger_frame_all {
+                    self.ui_state.trigger_frame_all = false;
+                    self.frame_all_models();
+                }
+
+                // Sync model visibility and representation changes from UI to ModelManager
+                for ui_model in &self.ui_state.models.clone() {
+                    if let Some(model) = self.model_manager.get_model_mut(ui_model.id) {
+                        model.visible = ui_model.visible;
+                        model.representation = match ui_model.representation {
+                            UIRepType::VanDerWaals => RepresentationType::VanDerWaals,
+                            UIRepType::BallStick => RepresentationType::BallAndStick,
+                            UIRepType::Ribbon => RepresentationType::Ribbon,
+                            UIRepType::Surface => RepresentationType::Surface,
+                            UIRepType::SurfaceRaymarch => RepresentationType::SurfaceRaymarch,
+                            UIRepType::SphereRaymarch => RepresentationType::SphereRaymarch,
+                        };
+                    }
+                }
+
                 if let (Some(renderer), Some(egui_ctx), Some(egui_state), Some(egui_renderer), Some(window)) =
                     (&mut self.renderer, &self.egui_ctx, &mut self.egui_state, &mut self.egui_renderer, &self.window)
                 {
@@ -581,22 +823,35 @@ impl ApplicationHandler for App {
 
                     // Sync UI state changes back to renderer
                     if self.ui_state.representation != old_representation {
-                        // Representation changed from UI
+                        // Representation changed from UI or keyboard
                         renderer.representation = match self.ui_state.representation {
                             UIRepType::VanDerWaals => RepresentationType::VanDerWaals,
                             UIRepType::BallStick => RepresentationType::BallAndStick,
                             UIRepType::Ribbon => RepresentationType::Ribbon,
                             UIRepType::Surface => RepresentationType::Surface,
+                            UIRepType::SurfaceRaymarch => RepresentationType::SurfaceRaymarch,
+                            UIRepType::SphereRaymarch => RepresentationType::SphereRaymarch,
                         };
+
+                        // Also update all model representations to match global
+                        for model_info in &mut self.ui_state.models {
+                            model_info.representation = self.ui_state.representation;
+                        }
+
+                        // Also update model_manager models to ensure sync in same frame
+                        for model in self.model_manager.all_models_mut() {
+                            model.representation = renderer.representation;
+                        }
+
                         self.ui_state.representation_changed = true;
-                        log::info!("Representation changed from UI to {:?}", renderer.representation);
+                        log::info!("Representation changed to {:?}", renderer.representation);
                     }
 
                     // Handle representation changes - TWO FRAME SYSTEM for loading UI
                     // Frame 1: Detect change, show loading UI
                     // Frame 2: Generate geometry (in next frame so UI renders)
 
-                    if self.ui_state.representation_changed && self.trajectory.is_some() {
+                    if self.ui_state.representation_changed && !self.model_manager.is_empty() {
                         // First frame: Just mark as pending and show loading UI
                         self.ui_state.pending_representation = Some(self.ui_state.representation);
                         self.ui_state.representation_changed = false;
@@ -606,18 +861,20 @@ impl ApplicationHandler for App {
                             UIRepType::BallStick => "Loading Ball & Stick...".to_string(),
                             UIRepType::Ribbon => "Loading Ribbon...".to_string(),
                             UIRepType::Surface => "Generating Surface (this may take a moment)...".to_string(),
+                            UIRepType::SurfaceRaymarch => "Preparing Raymarching Surface...".to_string(),
+                            UIRepType::SphereRaymarch => "Preparing Sphere Raymarch...".to_string(),
                             UIRepType::VanDerWaals => String::new(),
                         };
 
                         self.ui_state.loading_representation = match self.ui_state.representation {
-                            UIRepType::VanDerWaals => false,
+                            UIRepType::VanDerWaals | UIRepType::SurfaceRaymarch | UIRepType::SphereRaymarch => false,
                             _ => true,
                         };
                     }
 
                     // Second frame: Actually generate the geometry
                     if let Some(pending_rep) = self.ui_state.pending_representation {
-                        if let Some(ref trajectory) = self.trajectory {
+                        if let Some(ref trajectory) = self.model_manager.visible_models().next().map(|m| &m.trajectory) {
                             let protein = &trajectory.topology;
                             match pending_rep {
                                 UIRepType::BallStick => {
@@ -632,6 +889,14 @@ impl ApplicationHandler for App {
                                     log::info!("Generating surface geometry...");
                                     renderer.ensure_surface(protein);
                                 }
+                                UIRepType::SurfaceRaymarch => {
+                                    log::info!("Preparing raymarching surface...");
+                                    renderer.ensure_surface_raymarch(protein);
+                                }
+                                UIRepType::SphereRaymarch => {
+                                    log::info!("Preparing sphere raymarch...");
+                                    renderer.ensure_sphere_raymarch(protein);
+                                }
                                 UIRepType::VanDerWaals => {
                                     // VdW is always loaded, nothing to do
                                 }
@@ -645,7 +910,7 @@ impl ApplicationHandler for App {
 
                     // Handle camera reset from UI
                     if self.ui_state.reset_camera {
-                        if let Some(ref trajectory) = self.trajectory {
+                        if let Some(ref trajectory) = self.model_manager.visible_models().next().map(|m| &m.trajectory) {
                             let protein = &trajectory.topology;
                             renderer.camera.look_at(protein.center());
                             let (min, max) = protein.bounding_box();
@@ -661,19 +926,7 @@ impl ApplicationHandler for App {
                         surface_renderer.set_alpha(&renderer.queue, self.ui_state.alpha);
                     }
 
-                    // Update atom selection highlighting
-                    if !self.ui_state.selected_atoms.is_empty() {
-                        if let Some(ref trajectory) = self.trajectory {
-                            let protein = &trajectory.topology;
-                            renderer.update_selection(protein, &self.ui_state.selected_atoms);
-                        }
-                    }
-
-                    // Update visible instances with LOD + frustum culling
-                    if let Some(ref trajectory) = self.trajectory {
-                        let protein = &trajectory.topology;
-                        renderer.update_visible_instances(protein);
-                    }
+                    // We'll process and render each visible model in the render loop below
 
                     // Handle animation frame updates
                     if self.ui_state.is_animated && self.ui_state.playing {
@@ -708,7 +961,7 @@ impl ApplicationHandler for App {
                         }
 
                         // Update atom positions from current frame
-                        if let Some(ref trajectory) = self.trajectory {
+                        if let Some(ref trajectory) = self.model_manager.visible_models().next().map(|m| &m.trajectory) {
                             if let Some(frame) = trajectory.frames.get(self.ui_state.current_frame) {
                                 renderer.update_atom_positions(&trajectory.topology, &frame.coords);
                             }
@@ -763,7 +1016,7 @@ impl ApplicationHandler for App {
 
                     // Handle VR grip selection (outside renderer borrow)
                     if let Some(grip_pose) = vr_grip_selection {
-                        if let Some(ref trajectory) = self.trajectory {
+                        if let Some(ref trajectory) = self.model_manager.visible_models().next().map(|m| &m.trajectory) {
                             let protein = &trajectory.topology;
                             let ray = mol_vr::controller_ray(&grip_pose);
 
@@ -810,27 +1063,151 @@ impl ApplicationHandler for App {
                                 label: Some("Render Encoder"),
                             });
 
-                            // Render 3D scene
-                            {
+                            // Render 3D scene - Support multiple models with independent representations
+                            // Collect all visible models first
+                            let visible_models: Vec<_> = self.model_manager.visible_models().collect();
+
+                            // Render each model in its own pass
+                            for (model_idx, model) in visible_models.iter().enumerate() {
+                                let protein = &model.trajectory.topology;
+
+                                // Load this model's protein data into renderer
+                                // NOTE: Must reload for each model since renderer only holds one model's data at a time
+                                renderer.load_protein(protein);
+                                renderer.update_visible_instances(protein);
+
+                                // Update atom selection highlighting (only for first model for now)
+                                if !self.ui_state.selected_atoms.is_empty() && model_idx == 0 {
+                                    renderer.update_selection(protein, &self.ui_state.selected_atoms);
+                                }
+
+                                // Set representation from THIS model's setting
+                                let model_representation = match model.representation {
+                                    RepresentationType::VanDerWaals => mol_render::RepresentationType::VanDerWaals,
+                                    RepresentationType::BallAndStick => mol_render::RepresentationType::BallAndStick,
+                                    RepresentationType::Ribbon => mol_render::RepresentationType::Ribbon,
+                                    RepresentationType::Surface => mol_render::RepresentationType::Surface,
+                                    RepresentationType::SurfaceRaymarch => mol_render::RepresentationType::SurfaceRaymarch,
+                                    RepresentationType::SphereRaymarch => mol_render::RepresentationType::SphereRaymarch,
+                                };
+
+                                renderer.representation = model_representation;
+
+                                // Ensure geometry is loaded for THIS model's representation
+                                // This must be done per-model to handle multiple models with same representation
+                                match model_representation {
+                                    mol_render::RepresentationType::BallAndStick => {
+                                        renderer.ensure_ball_stick(protein);
+                                    }
+                                    mol_render::RepresentationType::Ribbon => {
+                                        renderer.ensure_ribbon(protein);
+                                    }
+                                    mol_render::RepresentationType::Surface => {
+                                        renderer.ensure_surface(protein);
+                                    }
+                                    mol_render::RepresentationType::SurfaceRaymarch => {
+                                        renderer.ensure_surface_raymarch(protein);
+                                    }
+                                    mol_render::RepresentationType::SphereRaymarch => {
+                                        renderer.ensure_sphere_raymarch(protein);
+                                    }
+                                    _ => {}
+                                }
+
+                                // Create render pass for this model
+                                // First model clears, subsequent models load existing content
+                                let load_op = if model_idx == 0 {
+                                    wgpu::LoadOp::Clear(wgpu::Color {
+                                        r: 0.1,
+                                        g: 0.1,
+                                        b: 0.1,
+                                        a: 1.0,
+                                    })
+                                } else {
+                                    wgpu::LoadOp::Load
+                                };
+
+                                let depth_load_op = if model_idx == 0 {
+                                    wgpu::LoadOp::Clear(1.0)
+                                } else {
+                                    wgpu::LoadOp::Load
+                                };
+
+                                {
+                                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                        label: Some("Model Render Pass"),
+                                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                            view: &view,
+                                            resolve_target: None,
+                                            ops: wgpu::Operations {
+                                                load: load_op,
+                                                store: wgpu::StoreOp::Store,
+                                            },
+                                        })],
+                                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                                            view: &renderer.depth_view,
+                                            depth_ops: Some(wgpu::Operations {
+                                                load: depth_load_op,
+                                                store: wgpu::StoreOp::Store,
+                                            }),
+                                            stencil_ops: None,
+                                        }),
+                                        timestamp_writes: None,
+                                        occlusion_query_set: None,
+                                    });
+
+                                    render_pass.set_bind_group(0, &renderer.camera_bind_group, &[]);
+
+                                    // Render THIS model with its representation
+                                    match model_representation {
+                                        mol_render::RepresentationType::VanDerWaals => {
+                                            renderer.spheres_renderer.render(&mut render_pass);
+                                        }
+                                        mol_render::RepresentationType::BallAndStick => {
+                                            if let Some(ref ball_stick) = renderer.ball_stick_renderer {
+                                                ball_stick.render(&mut render_pass);
+                                            }
+                                        }
+                                        mol_render::RepresentationType::Ribbon => {
+                                            if let Some(ref ribbon) = renderer.ribbon_renderer {
+                                                ribbon.render(&mut render_pass);
+                                            }
+                                        }
+                                        mol_render::RepresentationType::Surface => {
+                                            if let Some(ref surface) = renderer.surface_renderer {
+                                                surface.render(&mut render_pass);
+                                            }
+                                        }
+                                        mol_render::RepresentationType::SurfaceRaymarch => {
+                                            if let Some(ref surface_rm) = renderer.surface_raymarch_renderer {
+                                                surface_rm.render(&mut render_pass);
+                                            }
+                                        }
+                                        mol_render::RepresentationType::SphereRaymarch => {
+                                            if let Some(ref sphere_rm) = renderer.sphere_raymarch_renderer {
+                                                sphere_rm.render(&mut render_pass);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Render coordinate axes in a final pass
+                            if self.ui_state.show_axes {
                                 let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("Render Pass"),
+                                    label: Some("Axes Render Pass"),
                                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                                         view: &view,
                                         resolve_target: None,
                                         ops: wgpu::Operations {
-                                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                                r: 0.1,
-                                                g: 0.1,
-                                                b: 0.1,
-                                                a: 1.0,
-                                            }),
+                                            load: wgpu::LoadOp::Load,
                                             store: wgpu::StoreOp::Store,
                                         },
                                     })],
                                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                                         view: &renderer.depth_view,
                                         depth_ops: Some(wgpu::Operations {
-                                            load: wgpu::LoadOp::Clear(1.0),
+                                            load: wgpu::LoadOp::Load,
                                             store: wgpu::StoreOp::Store,
                                         }),
                                         stencil_ops: None,
@@ -840,27 +1217,7 @@ impl ApplicationHandler for App {
                                 });
 
                                 render_pass.set_bind_group(0, &renderer.camera_bind_group, &[]);
-
-                                match renderer.representation {
-                                    mol_render::RepresentationType::VanDerWaals => {
-                                        renderer.spheres_renderer.render(&mut render_pass);
-                                    }
-                                    mol_render::RepresentationType::BallAndStick => {
-                                        if let Some(ref ball_stick) = renderer.ball_stick_renderer {
-                                            ball_stick.render(&mut render_pass);
-                                        }
-                                    }
-                                    mol_render::RepresentationType::Ribbon => {
-                                        if let Some(ref ribbon) = renderer.ribbon_renderer {
-                                            ribbon.render(&mut render_pass);
-                                        }
-                                    }
-                                    mol_render::RepresentationType::Surface => {
-                                        if let Some(ref surface) = renderer.surface_renderer {
-                                            surface.render(&mut render_pass);
-                                        }
-                                    }
-                                }
+                                renderer.axes_renderer.render(&mut render_pass);
                             }
 
                             // Render egui
@@ -1038,7 +1395,9 @@ fn main() -> Result<()> {
     log::info!("  1: Van der Waals representation");
     log::info!("  2: Ball-and-Stick representation");
     log::info!("  3: Ribbon representation");
-    log::info!("  4: Surface representation");
+    log::info!("  4: Surface representation (marching cubes)");
+    log::info!("  5: Surface representation (raymarching - realtime)");
+    log::info!("  6: Spheres Realtime (fast raymarched spheres)");
     log::info!("  R: Reset camera");
     log::info!("  U: Toggle UI");
     log::info!("  ESC: Quit");
@@ -1062,15 +1421,21 @@ fn main() -> Result<()> {
         log::info!("Example VR: {} --vr 9PZW.pdb", args[0]);
     }
 
-    // Determine VR mode: explicit flag or auto-detect
+    // Determine VR mode: only check when --vr flag is passed
     let vr_mode = if vr_flag {
         log::info!("VR mode explicitly requested via --vr flag");
-        true
-    } else if detect_vr_availability() {
-        log::info!("VR runtime detected, but starting in desktop mode");
-        log::info!("Use --vr flag to start in VR mode");
-        false
+        // Check if VR runtime is available
+        if detect_vr_availability() {
+            log::info!("OpenXR runtime detected, starting in VR mode");
+            true
+        } else {
+            log::error!("VR mode requested but no OpenXR runtime found!");
+            log::error!("Please install SteamVR, Oculus Software, or Windows Mixed Reality");
+            return Err(anyhow::anyhow!("OpenXR runtime not available"));
+        }
     } else {
+        // Skip VR auto-detection to avoid loading openxr_loader.dll on PC
+        log::debug!("Starting in desktop mode (use --vr flag for VR mode)");
         false
     };
 

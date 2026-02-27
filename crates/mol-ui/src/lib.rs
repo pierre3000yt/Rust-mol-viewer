@@ -7,17 +7,17 @@ pub use panels::*;
 
 /// UI State for the molecular viewer
 pub struct MolecularUI {
-    pub show_controls: bool,
     pub show_info: bool,
     pub show_settings: bool,
+    pub show_models: bool,
 }
 
 impl Default for MolecularUI {
     fn default() -> Self {
         Self {
-            show_controls: true,
             show_info: true,
             show_settings: false,
+            show_models: true,
         }
     }
 }
@@ -44,7 +44,7 @@ impl MolecularUI {
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("View", |ui| {
-                    ui.checkbox(&mut self.show_controls, "Controls");
+                    ui.checkbox(&mut self.show_models, "Models");
                     ui.checkbox(&mut self.show_info, "Information");
                     ui.checkbox(&mut self.show_settings, "Settings");
                     ui.separator();
@@ -83,6 +83,21 @@ impl MolecularUI {
                         }
                         ui.close_menu();
                     }
+                    ui.separator();
+                    if ui.selectable_label(state.representation == RepresentationType::SurfaceRaymarch, "Surface Realtime (5)").clicked() {
+                        if state.representation != RepresentationType::SurfaceRaymarch {
+                            state.representation = RepresentationType::SurfaceRaymarch;
+                            state.representation_changed = true;
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.selectable_label(state.representation == RepresentationType::SphereRaymarch, "Spheres Realtime (6)").clicked() {
+                        if state.representation != RepresentationType::SphereRaymarch {
+                            state.representation = RepresentationType::SphereRaymarch;
+                            state.representation_changed = true;
+                        }
+                        ui.close_menu();
+                    }
                 });
 
                 ui.menu_button("Help", |ui| {
@@ -90,7 +105,7 @@ impl MolecularUI {
                     ui.label("• Left mouse drag: Rotate");
                     ui.label("• Right mouse drag: Pan");
                     ui.label("• Mouse wheel: Zoom");
-                    ui.label("• 1-4: Change representation");
+                    ui.label("• 1-6: Change representation");
                     ui.label("• U: Toggle UI");
                     ui.label("• R: Reset camera");
                     ui.label("• ESC: Quit");
@@ -98,9 +113,9 @@ impl MolecularUI {
             });
         });
 
-        // Control panel (left side)
-        if self.show_controls {
-            panels::controls_panel(ctx, state);
+        // Models panel (left side)
+        if self.show_models {
+            panels::models_panel(ctx, state);
         }
 
         // Information panel (right side)
@@ -164,6 +179,16 @@ impl AtomSelectionInfo {
     }
 }
 
+/// Information about a loaded model for display in UI
+#[derive(Clone)]
+pub struct ModelInfo {
+    pub id: usize,
+    pub name: String,
+    pub visible: bool,
+    pub representation: RepresentationType,
+    pub atom_count: usize,
+}
+
 /// Shared UI state that gets passed between UI and renderer
 #[derive(Clone)]
 pub struct UIState {
@@ -217,6 +242,16 @@ pub struct UIState {
     pub total_frames: usize,
     pub animation_fps: f32,
     pub loop_mode: pdb_parser::LoopMode,
+
+    // Multi-model support
+    pub models: Vec<ModelInfo>,
+    pub trigger_load_add: bool,
+    pub trigger_load_replace: bool,
+    pub model_to_remove: Option<usize>,
+
+    // Display options
+    pub show_axes: bool,
+    pub trigger_frame_all: bool,
 }
 
 impl Default for UIState {
@@ -255,6 +290,12 @@ impl Default for UIState {
             total_frames: 1,
             animation_fps: 30.0,
             loop_mode: pdb_parser::LoopMode::Loop,
+            models: Vec::new(),
+            trigger_load_add: false,
+            trigger_load_replace: false,
+            model_to_remove: None,
+            show_axes: true,
+            trigger_frame_all: false,
         }
     }
 }
@@ -265,6 +306,8 @@ pub enum RepresentationType {
     BallStick,
     Ribbon,
     Surface,
+    SurfaceRaymarch,  // Real-time raymarching SDF surface
+    SphereRaymarch,   // Raymarched individual spheres
 }
 
 impl std::fmt::Display for RepresentationType {
@@ -274,6 +317,8 @@ impl std::fmt::Display for RepresentationType {
             Self::BallStick => write!(f, "Ball & Stick"),
             Self::Ribbon => write!(f, "Ribbon"),
             Self::Surface => write!(f, "Surface"),
+            Self::SurfaceRaymarch => write!(f, "Surface (Realtime)"),
+            Self::SphereRaymarch => write!(f, "Spheres (Realtime)"),
         }
     }
 }
