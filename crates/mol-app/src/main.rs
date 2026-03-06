@@ -1312,6 +1312,10 @@ impl ApplicationHandler for App {
 
                                                     // Apply button actions
                                                     if let Some(rt) = repr_choice {
+                                                        // Mirror exactly what the keyboard shortcuts do (keys 1-4):
+                                                        // set renderer.representation + ui_state flags so the
+                                                        // geometry-rebuild path at the bottom of the frame triggers.
+                                                        renderer.representation = rt;
                                                         self.ui_state.representation = match rt {
                                                             RepresentationType::VanDerWaals => UIRepType::VanDerWaals,
                                                             RepresentationType::BallAndStick => UIRepType::BallStick,
@@ -1319,6 +1323,7 @@ impl ApplicationHandler for App {
                                                             RepresentationType::Surface => UIRepType::Surface,
                                                             _ => UIRepType::VanDerWaals,
                                                         };
+                                                        self.ui_state.representation_changed = true;
                                                     }
                                                     if do_reset {
                                                         self.vr_mol_position = glam::Vec3::new(0.0, 1.4, -1.5);
