@@ -56,6 +56,9 @@ struct App {
     vr_right_ctrl_pos: glam::Vec3,
     /// Head centre (average of both eye positions) in stage space (meters).
     vr_head_pos: glam::Vec3,
+    /// predicted_display_time from the previous frame (nanoseconds).
+    /// Used for pose queries so they get a valid time instead of t=0.
+    vr_last_display_time: i64,
 
     // VR input state (for edge detection)
     prev_right_grip: bool,
@@ -109,6 +112,7 @@ impl App {
             vr_left_ctrl_pos: glam::Vec3::new(-0.3, 1.0, -0.3),
             vr_right_ctrl_pos: glam::Vec3::new(0.3, 1.0, -0.3),
             vr_head_pos: glam::Vec3::new(0.0, 1.6, 0.0),
+            vr_last_display_time: 0,
             prev_right_grip: false,
             last_frame_time: Instant::now(),
             frame_accumulator: 0.0,
@@ -1048,7 +1052,9 @@ impl ApplicationHandler for App {
                                 if let Ok(cs) = vr_renderer.vr_session.input.get_controller_state(
                                     &vr_renderer.vr_session.session,
                                     &vr_renderer.vr_session.stage_space,
-                                    openxr::Time::from_nanos(0),
+                                    // Use previous frame's display time — pose queries require a valid time,
+                                    // Time(0) returns default identity poses and the sphere won't move.
+                                    openxr::Time::from_nanos(self.vr_last_display_time),
                                 ) {
                                     // Right joystick → rotate molecule (Y axis = yaw, X axis = pitch)
                                     if cs.right_joystick.length() > 0.1 {
@@ -1068,16 +1074,19 @@ impl ApplicationHandler for App {
                                         self.vr_mol_position.x += cs.left_joystick.x * 0.5 * dt;
                                     }
 
-                                    // Store controller poses for sphere rendering & menu placement
+                                    // Store controller poses for sphere rendering
                                     self.vr_left_ctrl_pos  = cs.left_pose.position;
                                     self.vr_right_ctrl_pos = cs.right_pose.position;
-                                    // Menu appears at left controller position (updated below from views for billboarding)
-                                    self.vr_menu_world_pos = cs.left_pose.position;
 
                                     // Left grip (edge) → toggle floating menu
                                     let left_grip = cs.left_grip_pressed;
                                     if left_grip && !self.vr_prev_left_grip {
                                         self.vr_menu_visible = !self.vr_menu_visible;
+                                        if self.vr_menu_visible {
+                                            // Snapshot controller position when menu opens.
+                                            // Menu stays fixed there; left hand is free to move.
+                                            self.vr_menu_world_pos = cs.left_pose.position;
+                                        }
                                         log::info!("VR menu: {}", if self.vr_menu_visible { "opened" } else { "closed" });
                                     }
                                     self.vr_prev_left_grip = left_grip;
@@ -1190,6 +1199,9 @@ impl ApplicationHandler for App {
                             if session_active {
                                 match vr.begin_frame() {
                                     Ok(frame_state) => {
+                                        // Cache display time so next frame's pose queries get a valid time.
+                                        self.vr_last_display_time = frame_state.predicted_display_time.as_nanos();
+
                                         if frame_state.should_render {
                                             // Build per-eye camera uniforms directly from OpenXR 6DoF poses.
                                             // Scale: 1 Å = 2 mm (0.002 m), molecule placed 1.5 m ahead at 1.4 m height.
