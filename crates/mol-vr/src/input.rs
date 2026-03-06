@@ -62,9 +62,9 @@ pub struct VrInput {
     _left_hand_pose_action: xr::Action<xr::Posef>,
     _right_hand_pose_action: xr::Action<xr::Posef>,
 
-    // Button actions (boolean)
-    left_grip_action: xr::Action<bool>,
-    right_grip_action: xr::Action<bool>,
+    // Grip actions (float — Oculus Touch squeeze/value, threshold at 0.5 for "pressed")
+    left_grip_action: xr::Action<f32>,
+    right_grip_action: xr::Action<f32>,
     teleport_action: xr::Action<bool>,
 
     // Analog actions (float)
@@ -101,16 +101,16 @@ impl VrInput {
             &[],
         )?;
 
-        // Create button actions
-        let left_grip_action = action_set.create_action::<bool>(
+        // Create grip actions — Oculus Touch uses squeeze/value (float), not squeeze/click
+        let left_grip_action = action_set.create_action::<f32>(
             "left_grip",
-            "Left Grip Button",
+            "Left Grip",
             &[],
         )?;
 
-        let right_grip_action = action_set.create_action::<bool>(
+        let right_grip_action = action_set.create_action::<f32>(
             "right_grip",
-            "Right Grip Button",
+            "Right Grip",
             &[],
         )?;
 
@@ -162,15 +162,15 @@ impl VrInput {
                     &right_hand_pose_action,
                     instance.string_to_path("/user/hand/right/input/grip/pose")?,
                 ),
-                // Left grip
+                // Left grip (squeeze/value is a float; we threshold it to get pressed/released)
                 xr::Binding::new(
                     &left_grip_action,
-                    instance.string_to_path("/user/hand/left/input/squeeze/click")?,
+                    instance.string_to_path("/user/hand/left/input/squeeze/value")?,
                 ),
                 // Right grip
                 xr::Binding::new(
                     &right_grip_action,
-                    instance.string_to_path("/user/hand/right/input/squeeze/click")?,
+                    instance.string_to_path("/user/hand/right/input/squeeze/value")?,
                 ),
                 // Left trigger
                 xr::Binding::new(
@@ -293,15 +293,15 @@ impl VrInput {
             }
         }
 
-        // Get button states
+        // Get grip states (float squeeze/value → threshold at 0.5 for "pressed")
         state.left_grip_pressed = self.left_grip_action
             .state(session, xr::Path::NULL)
-            .map(|s| s.current_state)
+            .map(|s| s.current_state > 0.5)
             .unwrap_or(false);
 
         state.right_grip_pressed = self.right_grip_action
             .state(session, xr::Path::NULL)
-            .map(|s| s.current_state)
+            .map(|s| s.current_state > 0.5)
             .unwrap_or(false);
 
         state.teleport_pressed = self.teleport_action

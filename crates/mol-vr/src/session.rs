@@ -7,12 +7,15 @@
 //! - Session state transitions
 
 use anyhow::{Context, Result};
+use ash::vk;
+use ash::vk::Handle as _;
 use glam::{Quat, Vec3};
 use log::{debug, info, warn};
 use openxr as xr;
 use wgpu;
 
 use crate::input::VrInput;
+use crate::vulkan_init::WgpuVulkanContext;
 
 /// OpenXR session state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,35 +107,64 @@ impl VrSwapchain {
             })
             .context("Failed to create OpenXR swapchain")?;
 
-        // Enumerate swapchain images
+        // Enumerate swapchain images (OpenXR returns raw VkImage handles as u64)
         let xr_images = handle.enumerate_images()?;
 
-        // Create wgpu textures from OpenXR images
-        // NOTE: This requires wgpu-OpenXR interop which will be implemented based on backend
-        // For now, create placeholder textures
+        // Wrap OpenXR's VkImages as wgpu textures via wgpu::hal Vulkan backend
         let mut images = Vec::with_capacity(xr_images.len());
         let mut views = Vec::with_capacity(xr_images.len());
 
-        for _xr_image in &xr_images {
-            // TODO: Create wgpu::Texture from Vulkan image handle
-            // This will use wgpu::hal::vulkan to wrap the OpenXR images
-            let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("VR Swapchain Texture"),
-                size: wgpu::Extent3d {
-                    width: resolution.0,
-                    height: resolution.1,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
+        let hal_desc = wgpu::hal::TextureDescriptor {
+            label: Some("VR Swapchain Image"),
+            size: wgpu::Extent3d {
+                width: resolution.0,
+                height: resolution.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::hal::TextureUses::COLOR_TARGET,
+            memory_flags: wgpu::hal::MemoryFlags::empty(),
+            view_formats: vec![],
+        };
+
+        let wgpu_desc = wgpu::TextureDescriptor {
+            label: Some("VR Swapchain Texture"),
+            size: wgpu::Extent3d {
+                width: resolution.0,
+                height: resolution.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        };
+
+        for &xr_image_raw in &xr_images {
+            // Separate unsafe call from ? operator to avoid type inference ambiguity
+            // as_hal in wgpu 22 passes &Device directly (not Option) and returns Option<R>
+            let opt_hal_texture: Option<wgpu::hal::vulkan::Texture> = unsafe {
+                device.as_hal::<wgpu::hal::api::Vulkan, _, wgpu::hal::vulkan::Texture>(|_d| {
+                    wgpu::hal::vulkan::Device::texture_from_raw(
+                        vk::Image::from_raw(xr_image_raw),
+                        &hal_desc,
+                        None, // OpenXR owns the image lifetime
+                    )
+                })
+            };
+            let hal_texture = opt_hal_texture
+                .ok_or_else(|| anyhow::anyhow!("wgpu is not using the Vulkan backend"))?;
+
+            let texture = unsafe {
+                device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &wgpu_desc)
+            };
 
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
             images.push(texture);
             views.push(view);
         }
@@ -209,33 +241,28 @@ pub struct VrSession {
 }
 
 impl VrSession {
-    /// Create a new VR session
-    pub fn new() -> Result<Self> {
+    /// Create a new VR session.
+    ///
+    /// Returns `(VrSession, WgpuVulkanContext)`. The caller must wrap the `WgpuVulkanContext`
+    /// into a `wgpu::Instance` / `wgpu::Device` via `from_hal` before it can be used for
+    /// rendering. This split is necessary because OpenXR needs to inject its required Vulkan
+    /// extensions (external memory/semaphore on Windows) before the device is created.
+    pub fn new() -> Result<(Self, WgpuVulkanContext)> {
         info!("Initializing OpenXR session...");
 
-        // Create OpenXR instance
+        // ── Create OpenXR instance ─────────────────────────────────────────────
         let entry = unsafe { xr::Entry::load()? };
 
-        // Check available extensions
         let available_extensions = entry.enumerate_extensions()?;
         debug!("Available OpenXR extensions: {:?}", available_extensions);
 
-        // Request Vulkan graphics extension
-        #[cfg(target_os = "windows")]
         let mut enabled_extensions = xr::ExtensionSet::default();
-        #[cfg(target_os = "windows")]
-        {
+        if available_extensions.khr_vulkan_enable2 {
             enabled_extensions.khr_vulkan_enable2 = true;
+        } else {
+            anyhow::bail!("OpenXR runtime does not support khr_vulkan_enable2 — cannot interop with wgpu");
         }
 
-        #[cfg(not(target_os = "windows"))]
-        let mut enabled_extensions = xr::ExtensionSet::default();
-        #[cfg(not(target_os = "windows"))]
-        {
-            enabled_extensions.khr_vulkan_enable = true;
-        }
-
-        // Create instance
         let instance = entry.create_instance(
             &xr::ApplicationInfo {
                 application_name: "PDB Visual VR",
@@ -250,16 +277,15 @@ impl VrSession {
 
         info!("OpenXR instance created: {:?}", instance.properties()?);
 
-        // Get system
+        // ── Get system ────────────────────────────────────────────────────────
         let system = instance.system(xr::FormFactor::HEAD_MOUNTED_DISPLAY)?;
 
-        // Get system properties
         let system_props = instance.system_properties(system)?;
         info!("VR System: {}", system_props.system_name);
 
-        // Get view configuration
         let view_config_type = xr::ViewConfigurationType::PRIMARY_STEREO;
-        let view_config_views = instance.enumerate_view_configuration_views(system, view_config_type)?;
+        let view_config_views =
+            instance.enumerate_view_configuration_views(system, view_config_type)?;
 
         info!("View configuration:");
         for (i, view) in view_config_views.iter().enumerate() {
@@ -273,27 +299,49 @@ impl VrSession {
             );
         }
 
-        // TODO: Create Vulkan-backed wgpu instance for OpenXR interop
-        // For now, create session without graphics binding (will add in next iteration)
+        // ── Mandatory graphics requirements call ───────────────────────────────
+        let vk_reqs = instance
+            .graphics_requirements::<xr::Vulkan>(system)
+            .context("Failed to get Vulkan graphics requirements")?;
+        info!(
+            "OpenXR Vulkan requirements: min={}.{}, max={}.{}",
+            vk_reqs.min_api_version_supported.major(),
+            vk_reqs.min_api_version_supported.minor(),
+            vk_reqs.max_api_version_supported.major(),
+            vk_reqs.max_api_version_supported.minor(),
+        );
 
-        // Create session (placeholder - needs Vulkan graphics binding)
-        let vk_instance = std::ptr::null(); // TODO: Get from wgpu
-        let vk_physical_device = std::ptr::null(); // TODO: Get from wgpu
-        let vk_device = std::ptr::null(); // TODO: Get from wgpu
-        let queue_family_index = 0; // TODO: Get from wgpu
-        let queue_index = 0;
+        // ── Create Vulkan context (with OpenXR-required extensions injected) ──
+        // This replaces the old approach of extracting handles from wgpu AFTER device creation.
+        // OpenXR's create_vulkan_instance / create_vulkan_device add VK_KHR_external_memory_win32
+        // and VK_KHR_external_semaphore_win32 so the runtime can composite the frame.
+        let vk_ctx = crate::vulkan_init::create_vulkan_context_for_openxr(&instance, system)
+            .context("Failed to create Vulkan context for OpenXR interop")?;
+
+        // ── Create OpenXR session ─────────────────────────────────────────────
+        let vk_instance_raw = vk_ctx.instance.handle().as_raw();
+        let vk_phd_raw = vk_ctx.physical_device.as_raw();
+        let vk_device_raw = vk_ctx.device.handle().as_raw();
+
+        info!(
+            "Creating OpenXR session: instance=0x{:016x}, pdev=0x{:016x}, dev=0x{:016x}, qfi={}",
+            vk_instance_raw, vk_phd_raw, vk_device_raw, vk_ctx.queue_family_index
+        );
 
         let session_create_info = xr::vulkan::SessionCreateInfo {
-            instance: vk_instance as _,
-            physical_device: vk_physical_device as _,
-            device: vk_device as _,
-            queue_family_index,
-            queue_index,
+            instance: vk_instance_raw as _,
+            physical_device: vk_phd_raw as _,
+            device: vk_device_raw as _,
+            queue_family_index: vk_ctx.queue_family_index,
+            queue_index: 0,
         };
 
         let (session, frame_waiter, frame_stream) = unsafe {
-            instance.create_session::<xr::Vulkan>(system, &session_create_info)?
+            instance
+                .create_session::<xr::Vulkan>(system, &session_create_info)
+                .context("xrCreateSession failed")?
         };
+        info!("OpenXR session created successfully");
 
         info!("OpenXR session created");
 
@@ -306,7 +354,7 @@ impl VrSession {
         // Create input system
         let input = VrInput::new(&instance, &session)?;
 
-        Ok(Self {
+        let vr_session = Self {
             instance,
             system,
             session,
@@ -319,7 +367,9 @@ impl VrSession {
             right_swapchain: None,
             views: Vec::new(),
             input,
-        })
+        };
+
+        Ok((vr_session, vk_ctx))
     }
 
     /// Poll OpenXR events and update session state
@@ -471,12 +521,54 @@ impl VrSession {
         ])
     }
 
+    /// Select the best swapchain format supported by the OpenXR runtime.
+    /// Queries the runtime's supported list and prefers RGBA8_SRGB (Oculus default),
+    /// falling back to RGBA8_UNORM, BGRA8_SRGB, BGRA8_UNORM in that order.
+    pub fn select_swapchain_format(&self) -> wgpu::TextureFormat {
+        // VkFormat constants (must match Vulkan spec)
+        const VK_FORMAT_R8G8B8A8_SRGB: u32 = 43;
+        const VK_FORMAT_R8G8B8A8_UNORM: u32 = 37;
+        const VK_FORMAT_B8G8R8A8_SRGB: u32 = 50;
+        const VK_FORMAT_B8G8R8A8_UNORM: u32 = 44;
+
+        let supported = match self.session.enumerate_swapchain_formats() {
+            Ok(formats) => {
+                info!("OpenXR supported swapchain formats (VkFormat values): {:?}", formats);
+                formats
+            }
+            Err(e) => {
+                warn!("Failed to enumerate swapchain formats: {} — defaulting to Rgba8UnormSrgb", e);
+                return wgpu::TextureFormat::Rgba8UnormSrgb;
+            }
+        };
+
+        // Preferred order: RGBA8_SRGB first (Oculus/Meta prefer this over BGRA)
+        let preferred: [(u32, wgpu::TextureFormat); 4] = [
+            (VK_FORMAT_R8G8B8A8_SRGB,  wgpu::TextureFormat::Rgba8UnormSrgb),
+            (VK_FORMAT_R8G8B8A8_UNORM, wgpu::TextureFormat::Rgba8Unorm),
+            (VK_FORMAT_B8G8R8A8_SRGB,  wgpu::TextureFormat::Bgra8UnormSrgb),
+            (VK_FORMAT_B8G8R8A8_UNORM, wgpu::TextureFormat::Bgra8Unorm),
+        ];
+
+        for (vk_fmt, wgpu_fmt) in &preferred {
+            if supported.contains(vk_fmt) {
+                info!("Selected swapchain format: {:?} (VkFormat {})", wgpu_fmt, vk_fmt);
+                return *wgpu_fmt;
+            }
+        }
+
+        warn!("None of the preferred swapchain formats are supported — defaulting to Rgba8UnormSrgb");
+        wgpu::TextureFormat::Rgba8UnormSrgb
+    }
+
     /// Create swapchains for stereo rendering
     pub fn create_swapchains(
         &mut self,
         device: &wgpu::Device,
-        format: wgpu::TextureFormat,
-    ) -> Result<()> {
+    ) -> Result<wgpu::TextureFormat> {
+        // Select the best format the OpenXR runtime actually supports
+        let format = self.select_swapchain_format();
+
         // Get recommended resolution from view configuration
         let view_config_views = self.instance.enumerate_view_configuration_views(
             self.system,
@@ -501,6 +593,6 @@ impl VrSession {
         self.left_swapchain = Some(VrSwapchain::new(&self.session, device, left_resolution, format)?);
         self.right_swapchain = Some(VrSwapchain::new(&self.session, device, right_resolution, format)?);
 
-        Ok(())
+        Ok(format)
     }
 }

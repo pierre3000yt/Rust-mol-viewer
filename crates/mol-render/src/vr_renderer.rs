@@ -5,6 +5,7 @@
 
 use crate::camera::{Camera, Eye};
 use anyhow::{Context, Result};
+use glam::{Mat4, Quat, Vec3, Vec4};
 use log::{info, warn};
 use mol_vr::{openxr, VrPerformanceMonitor, VrSession};
 use wgpu;
@@ -13,17 +14,21 @@ use wgpu;
 pub struct VrRenderer {
     pub vr_session: VrSession,
 
+    /// The wgpu texture format used by the VR swapchain (e.g. Rgba8UnormSrgb).
+    /// Render pipelines used in VR passes must target this format.
+    pub swapchain_format: wgpu::TextureFormat,
+
     // Depth textures for each eye (stored to keep alive, accessed via views)
     _left_depth_texture: wgpu::Texture,
-    left_depth_view: wgpu::TextureView,
+    pub left_depth_view: wgpu::TextureView,
     _right_depth_texture: wgpu::Texture,
-    right_depth_view: wgpu::TextureView,
+    pub right_depth_view: wgpu::TextureView,
 
     // Camera buffers for each eye
-    left_camera_buffer: wgpu::Buffer,
-    right_camera_buffer: wgpu::Buffer,
-    left_camera_bind_group: wgpu::BindGroup,
-    right_camera_bind_group: wgpu::BindGroup,
+    pub left_camera_buffer: wgpu::Buffer,
+    pub right_camera_buffer: wgpu::Buffer,
+    pub left_camera_bind_group: wgpu::BindGroup,
+    pub right_camera_bind_group: wgpu::BindGroup,
 
     // Performance monitoring
     performance_monitor: VrPerformanceMonitor,
@@ -31,42 +36,51 @@ pub struct VrRenderer {
 }
 
 impl VrRenderer {
-    /// Create a new VR renderer
+    /// Create a VR renderer from a pre-created `VrSession`.
+    ///
+    /// The session is created in `Renderer::new()` (together with the Vulkan context that
+    /// wgpu is then initialized from), so we receive it here already fully constructed.
     pub fn new(
+        mut vr_session: VrSession,
         device: &wgpu::Device,
         camera_bind_group_layout: &wgpu::BindGroupLayout,
-        surface_format: wgpu::TextureFormat,
     ) -> Result<Self> {
         info!("Initializing VR renderer...");
 
-        // Create VR session
-        let mut vr_session = VrSession::new()
-            .context("Failed to create VR session")?;
-
-        // Create swapchains
-        vr_session.create_swapchains(device, surface_format)
+        // Create swapchains — format is auto-selected from OpenXR's supported list
+        let swapchain_format = vr_session
+            .create_swapchains(device)
             .context("Failed to create VR swapchains")?;
+        info!("VR swapchains created with format: {:?}", swapchain_format);
 
         // Get swapchain resolution
-        let (left_width, left_height) = vr_session.left_swapchain
+        let (left_width, left_height) = vr_session
+            .left_swapchain
             .as_ref()
             .map(|s| s.resolution)
             .unwrap_or((2048, 2048));
 
-        let (right_width, right_height) = vr_session.right_swapchain
+        let (right_width, right_height) = vr_session
+            .right_swapchain
             .as_ref()
             .map(|s| s.resolution)
             .unwrap_or((2048, 2048));
 
-        info!("VR resolution - Left: {}x{}, Right: {}x{}",
-            left_width, left_height, right_width, right_height);
+        info!(
+            "VR resolution — Left: {}x{}, Right: {}x{}",
+            left_width, left_height, right_width, right_height
+        );
 
         // Create depth textures for each eye
-        let left_depth_texture = Self::create_depth_texture(device, left_width, left_height, "VR Left Depth");
-        let left_depth_view = left_depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let left_depth_texture =
+            Self::create_depth_texture(device, left_width, left_height, "VR Left Depth");
+        let left_depth_view =
+            left_depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let right_depth_texture = Self::create_depth_texture(device, right_width, right_height, "VR Right Depth");
-        let right_depth_view = right_depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let right_depth_texture =
+            Self::create_depth_texture(device, right_width, right_height, "VR Right Depth");
+        let right_depth_view =
+            right_depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Create camera uniform buffers for each eye
         let left_camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -106,6 +120,7 @@ impl VrRenderer {
 
         Ok(Self {
             vr_session,
+            swapchain_format,
             _left_depth_texture: left_depth_texture,
             left_depth_view,
             _right_depth_texture: right_depth_texture,
@@ -120,7 +135,12 @@ impl VrRenderer {
     }
 
     /// Create a depth texture for VR rendering
-    fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32, label: &str) -> wgpu::Texture {
+    fn create_depth_texture(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        label: &str,
+    ) -> wgpu::Texture {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d {
@@ -205,9 +225,15 @@ impl VrRenderer {
         }
 
         // Acquire swapchain images
-        let left_swapchain = self.vr_session.left_swapchain.as_mut()
+        let left_swapchain = self
+            .vr_session
+            .left_swapchain
+            .as_mut()
             .context("Left swapchain not available")?;
-        let right_swapchain = self.vr_session.right_swapchain.as_mut()
+        let right_swapchain = self
+            .vr_session
+            .right_swapchain
+            .as_mut()
             .context("Right swapchain not available")?;
 
         let left_image_index = left_swapchain.acquire_image()?;
@@ -222,8 +248,16 @@ impl VrRenderer {
         let left_uniform = camera.uniform_stereo(Eye::Left);
         let right_uniform = camera.uniform_stereo(Eye::Right);
 
-        queue.write_buffer(&self.left_camera_buffer, 0, bytemuck::cast_slice(&[left_uniform]));
-        queue.write_buffer(&self.right_camera_buffer, 0, bytemuck::cast_slice(&[right_uniform]));
+        queue.write_buffer(
+            &self.left_camera_buffer,
+            0,
+            bytemuck::cast_slice(&[left_uniform]),
+        );
+        queue.write_buffer(
+            &self.right_camera_buffer,
+            0,
+            bytemuck::cast_slice(&[right_uniform]),
+        );
 
         // LEFT EYE RENDER PASS
         {
@@ -256,10 +290,7 @@ impl VrRenderer {
                 occlusion_query_set: None,
             });
 
-            // Set camera bind group for left eye
             render_pass.set_bind_group(0, &self.left_camera_bind_group, &[]);
-
-            // Call the render callback for left eye
             render_eye(&render_pass, Eye::Left);
         }
 
@@ -294,10 +325,7 @@ impl VrRenderer {
                 occlusion_query_set: None,
             });
 
-            // Set camera bind group for right eye
             render_pass.set_bind_group(0, &self.right_camera_bind_group, &[]);
-
-            // Call the render callback for right eye
             render_eye(&render_pass, Eye::Right);
         }
 
@@ -305,10 +333,65 @@ impl VrRenderer {
         queue.submit(std::iter::once(encoder.finish()));
 
         // Release swapchain images
-        left_swapchain.release_image()?;
-        right_swapchain.release_image()?;
+        self.vr_session.left_swapchain.as_mut().unwrap().release_image()?;
+        self.vr_session.right_swapchain.as_mut().unwrap().release_image()?;
 
         Ok(())
+    }
+
+    /// Build a `CameraUniform` for one eye directly from an OpenXR view (6DoF).
+    ///
+    /// `mol_to_world` converts molecule coordinates (Angstroms, origin-centered) to
+    /// VR stage space (meters). A good default:
+    ///   `Mat4::from_scale_rotation_translation(Vec3::splat(0.002), Quat::IDENTITY, Vec3::new(0.0, 1.4, -1.5))`
+    /// This scales 1 Å → 2 mm and places the molecule at eye height 1.4 m, 1.5 m ahead.
+    ///
+    /// `near`/`far` are in VR stage space (meters), e.g. 0.02 and 100.0.
+    pub fn build_eye_uniform(
+        view: &mol_vr::session::ViewConfig,
+        near: f32,
+        far: f32,
+        mol_to_world: Mat4,
+    ) -> crate::camera::CameraUniform {
+        // Eye pose → world-from-eye transform
+        let world_from_eye =
+            Mat4::from_rotation_translation(view.orientation, view.position);
+        // Invert: this transforms from world (stage) space into eye (view) space
+        let eye_from_world = world_from_eye.inverse();
+
+        // Full view: first bring molecule into stage space, then into eye space
+        let view_matrix = eye_from_world * mol_to_world;
+
+        // Asymmetric projection from OpenXR FOV angles (same formula as existing camera code)
+        let l = near * view.fov.angle_left.tan();
+        let r = near * view.fov.angle_right.tan();
+        let b = near * view.fov.angle_down.tan();
+        let t = near * view.fov.angle_up.tan();
+        let w = r - l;
+        let h = t - b;
+        let d = far - near;
+        let proj_matrix = Mat4::from_cols(
+            Vec4::new(2.0 * near / w, 0.0, 0.0, 0.0),
+            Vec4::new(0.0, 2.0 * near / h, 0.0, 0.0),
+            Vec4::new(
+                (r + l) / w,
+                (t + b) / h,
+                -(far + near) / d,
+                -1.0,
+            ),
+            Vec4::new(0.0, 0.0, -2.0 * far * near / d, 0.0),
+        );
+
+        let view_proj = proj_matrix * view_matrix;
+
+        crate::camera::CameraUniform {
+            view_proj: view_proj.to_cols_array_2d(),
+            view: view_matrix.to_cols_array_2d(),
+            proj: proj_matrix.to_cols_array_2d(),
+            inv_view_proj: view_proj.inverse().to_cols_array_2d(),
+            view_pos: view.position.into(),
+            _padding: 0.0,
+        }
     }
 
     /// Poll VR events and update session state

@@ -542,9 +542,17 @@ impl ApplicationHandler for App {
                 log::info!("Usage: pdbvisual <pdb_file>");
             }
 
-            // Initialize renderer
-            let mut renderer = pollster::block_on(Renderer::new(window.clone()))
-                .expect("Failed to initialize renderer");
+            // Initialize renderer (forces Vulkan backend when VR mode is active)
+            let mut renderer = match pollster::block_on(Renderer::new(window.clone(), self.vr_mode)) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("═══════════════════════════════════════════");
+                    log::error!("FATAL: Failed to initialize renderer");
+                    log::error!("  {:#}", e);
+                    log::error!("═══════════════════════════════════════════");
+                    panic!("Failed to initialize renderer: {:#}", e);
+                }
+            };
 
             // Load first visible model into renderer
             if let Some(model) = self.model_manager.visible_models().next() {
@@ -1052,8 +1060,138 @@ impl ApplicationHandler for App {
                         }
                     }
 
+                    // ── VR Frame Loop ────────────────────────────────────────────────────
+                    // MUST call poll_events + begin_frame + end_frame every frame.
+                    // poll_events drives the session state machine (IDLE→READY→FOCUSED).
+                    // Without this the Quest 2 shows only the loading screen forever.
+                    if self.vr_mode {
+                        if let Some(ref mut vr) = renderer.vr_renderer {
+                            // Handle session state transitions
+                            match vr.poll_events() {
+                                Ok(false) => { event_loop.exit(); }
+                                Ok(true) => {}
+                                Err(e) => log::warn!("VR poll_events: {}", e),
+                            }
+
+                            use mol_vr::SessionState;
+                            // Include Ready: the frame loop MUST start right after session.begin()
+                            // so the runtime can transition Ready → Synchronized → Focused.
+                            // Without this the runtime never advances past Ready.
+                            let session_active = matches!(
+                                vr.vr_session.session_state,
+                                SessionState::Ready
+                                    | SessionState::Synchronized
+                                    | SessionState::Visible
+                                    | SessionState::Focused
+                            );
+
+                            if session_active {
+                                match vr.begin_frame() {
+                                    Ok(frame_state) => {
+                                        if frame_state.should_render {
+                                            // Build per-eye camera uniforms directly from OpenXR 6DoF poses.
+                                            // Scale: 1 Å = 2 mm (0.002 m), molecule placed 1.5 m ahead at 1.4 m height.
+                                            // This properly tracks head rotation and translation.
+                                            if let Ok(views) = vr.vr_session.get_view_configs() {
+                                                use glam::{Mat4, Quat, Vec3};
+                                                let mol_to_world = Mat4::from_scale_rotation_translation(
+                                                    Vec3::splat(0.002),
+                                                    Quat::IDENTITY,
+                                                    Vec3::new(0.0, 1.4, -1.5),
+                                                );
+                                                let left_uniform = mol_render::vr_renderer::VrRenderer::build_eye_uniform(
+                                                    &views[0], 0.02, 100.0, mol_to_world,
+                                                );
+                                                let right_uniform = mol_render::vr_renderer::VrRenderer::build_eye_uniform(
+                                                    &views[1], 0.02, 100.0, mol_to_world,
+                                                );
+                                                renderer.queue.write_buffer(&vr.left_camera_buffer, 0, bytemuck::cast_slice(&[left_uniform]));
+                                                renderer.queue.write_buffer(&vr.right_camera_buffer, 0, bytemuck::cast_slice(&[right_uniform]));
+                                            }
+
+                                            // Acquire swapchain images
+                                            let left_idx = vr.vr_session.left_swapchain.as_mut()
+                                                .and_then(|s| s.acquire_image().ok());
+                                            let right_idx = vr.vr_session.right_swapchain.as_mut()
+                                                .and_then(|s| s.acquire_image().ok());
+
+                                            if let (Some(left_idx), Some(right_idx)) = (left_idx, right_idx) {
+                                                let mut vr_enc = renderer.device.create_command_encoder(
+                                                    &wgpu::CommandEncoderDescriptor { label: Some("VR Encoder") }
+                                                );
+
+                                                // ── LEFT EYE ──────────────────────────────────────
+                                                {
+                                                    let color_view = &vr.vr_session.left_swapchain.as_ref().unwrap().views[left_idx];
+                                                    let mut pass = vr_enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                                        label: Some("VR Left Eye"),
+                                                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                                            view: color_view,
+                                                            resolve_target: None,
+                                                            ops: wgpu::Operations {
+                                                                load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.05, a: 1.0 }),
+                                                                store: wgpu::StoreOp::Store,
+                                                            },
+                                                        })],
+                                                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                                                            view: &vr.left_depth_view,
+                                                            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                                                            stencil_ops: None,
+                                                        }),
+                                                        timestamp_writes: None,
+                                                        occlusion_query_set: None,
+                                                    });
+                                                    pass.set_bind_group(0, &vr.left_camera_bind_group, &[]);
+                                                    if let Some(ref vr_sph) = renderer.vr_spheres_renderer {
+                                                        vr_sph.render(&mut pass);
+                                                    }
+                                                }
+
+                                                // ── RIGHT EYE ─────────────────────────────────────
+                                                {
+                                                    let color_view = &vr.vr_session.right_swapchain.as_ref().unwrap().views[right_idx];
+                                                    let mut pass = vr_enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                                        label: Some("VR Right Eye"),
+                                                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                                            view: color_view,
+                                                            resolve_target: None,
+                                                            ops: wgpu::Operations {
+                                                                load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.05, a: 1.0 }),
+                                                                store: wgpu::StoreOp::Store,
+                                                            },
+                                                        })],
+                                                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                                                            view: &vr.right_depth_view,
+                                                            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                                                            stencil_ops: None,
+                                                        }),
+                                                        timestamp_writes: None,
+                                                        occlusion_query_set: None,
+                                                    });
+                                                    pass.set_bind_group(0, &vr.right_camera_bind_group, &[]);
+                                                    if let Some(ref vr_sph) = renderer.vr_spheres_renderer {
+                                                        vr_sph.render(&mut pass);
+                                                    }
+                                                }
+
+                                                renderer.queue.submit(std::iter::once(vr_enc.finish()));
+
+                                                // Release swapchain images back to the runtime
+                                                if let Some(s) = vr.vr_session.left_swapchain.as_mut() { let _ = s.release_image(); }
+                                                if let Some(s) = vr.vr_session.right_swapchain.as_mut() { let _ = s.release_image(); }
+                                            }
+                                        }
+                                        if let Err(e) = vr.end_frame(&frame_state) {
+                                            log::warn!("VR end_frame: {}", e);
+                                        }
+                                    }
+                                    Err(e) => log::warn!("VR begin_frame: {}", e),
+                                }
+                            }
+                        }
+                    }
+
                     // Update camera and render 3D scene
-                    renderer.update();
 
                     match renderer.surface.get_current_texture() {
                         Ok(output) => {
@@ -1368,16 +1506,47 @@ impl ApplicationHandler for App {
     }
 }
 
-/// Detect if VR is available on this system
+/// Detect if VR is available on this system by trying to load the OpenXR runtime
 fn detect_vr_availability() -> bool {
-    // Try to create OpenXR instance
-    match mol_vr::VrSession::new() {
-        Ok(_) => {
-            log::info!("OpenXR VR runtime detected");
-            true
+    // Just check that the OpenXR loader DLL exists and loads — no extensions needed here.
+    // The actual session (with khr_vulkan_enable2) is created later in Renderer::new().
+    match unsafe { mol_vr::openxr::Entry::load() } {
+        Ok(entry) => {
+            // Try creating a minimal instance (no graphics extensions) to confirm runtime works
+            let no_ext = mol_vr::openxr::ExtensionSet::default();
+            match entry.create_instance(
+                &mol_vr::openxr::ApplicationInfo {
+                    application_name: "PDB Visual VR Detect",
+                    application_version: 1,
+                    engine_name: "",
+                    engine_version: 0,
+                    api_version: mol_vr::openxr::Version::new(1, 0, 0),
+                },
+                &no_ext,
+                &[],
+            ) {
+                Ok(instance) => {
+                    match instance.system(mol_vr::openxr::FormFactor::HEAD_MOUNTED_DISPLAY) {
+                        Ok(_) => {
+                            log::info!("OpenXR runtime detected (Oculus/SteamVR) with HMD");
+                            true
+                        }
+                        Err(e) => {
+                            // Runtime is present but no headset active — still try VR,
+                            // the session will block until headset is ready
+                            log::warn!("OpenXR runtime found but no HMD system yet: {} — attempting anyway", e);
+                            true
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("OpenXR instance creation failed: {}", e);
+                    false
+                }
+            }
         }
         Err(e) => {
-            log::debug!("OpenXR not available: {}", e);
+            log::warn!("OpenXR loader not found (openxr_loader.dll missing?): {}", e);
             false
         }
     }

@@ -9,11 +9,13 @@ pub mod picking;
 pub mod ui_panel;
 pub mod ui_interaction;
 pub mod performance;
+pub mod vulkan_init;
 
 // Re-export main types
 pub use session::{
     FovConfig, SessionState, ViewConfig, VrSession, VrSwapchain,
 };
+pub use vulkan_init::WgpuVulkanContext;
 pub use input::{
     ControllerState, Pose, VrInput,
 };

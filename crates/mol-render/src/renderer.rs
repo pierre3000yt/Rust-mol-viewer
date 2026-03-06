@@ -5,7 +5,7 @@ use crate::representations::spheres::SphereInstance;
 use crate::representations::billboards::BillboardInstance;
 use crate::lod::{LodSystem, LodGroups, LodLevel};
 use crate::culling::CullingSystem;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use glam::Vec3;
 use wgpu::util::DeviceExt;
 use std::collections::HashMap;
@@ -104,6 +104,9 @@ pub struct Renderer {
     gpu_spheres_low: Option<SpheresRenderer>,
     gpu_spheres_very_low: Option<SpheresRenderer>,
 
+    // VR sphere renderer compiled with the VR swapchain format (Rgba8UnormSrgb)
+    pub vr_spheres_renderer: Option<SpheresRenderer>,
+
     // LOD and culling systems
     lod_system: LodSystem,
     lod_groups: LodGroups,
@@ -155,59 +158,157 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub async fn new(window: std::sync::Arc<winit::window::Window>) -> Result<Self> {
+    pub async fn new(window: std::sync::Arc<winit::window::Window>, vr_mode: bool) -> Result<Self> {
         let size = window.inner_size();
 
-        // Create wgpu instance
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
-        });
+        // ── VR path: create Vulkan + OpenXR session first, then wrap in wgpu ─────
+        // This order is REQUIRED: the OpenXR runtime (Oculus) must inject its required
+        // Vulkan extensions (VK_KHR_external_semaphore_win32 etc.) before the VkDevice
+        // is created, otherwise xrCreateSession crashes in the runtime DLL.
+        let (instance, adapter, device, queue, initial_vr_session) = if vr_mode {
+            // Create VrSession (also creates VkInstance + VkDevice with OpenXR extensions)
+            let (vr_session, vk_ctx) = mol_vr::VrSession::new()
+                .context("Failed to create OpenXR VR session")?;
 
-        // Create surface
-        let surface = instance.create_surface(window.clone())?;
+            // Wrap the VkInstance in wgpu::hal
+            let hal_instance = unsafe {
+                wgpu::hal::vulkan::Instance::from_raw(
+                    vk_ctx.entry,
+                    vk_ctx.instance,
+                    vk_ctx.api_version,
+                    0, // android_sdk_version
+                    None, // debug_utils
+                    vk_ctx.instance_extensions,
+                    wgpu::InstanceFlags::empty(),
+                    false, // has_nv_optimus
+                    None, // drop_guard
+                )
+                .context("Failed to wrap VkInstance in wgpu HAL")?
+            };
 
-        // Request adapter
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .ok_or_else(|| anyhow::anyhow!("Failed to find an appropriate adapter"))?;
+            // Create wgpu::Instance from the HAL instance
+            let wgpu_instance = unsafe {
+                wgpu::Instance::from_hal::<wgpu::hal::api::Vulkan>(hal_instance)
+            };
 
-        // Check for GPU compute features support
-        let adapter_features = adapter.features();
-        let supports_compute = adapter_features.contains(wgpu::Features::INDIRECT_FIRST_INSTANCE);
+            // Expose the physical device as a wgpu Adapter
+            let hal_adapter = unsafe {
+                wgpu_instance
+                    .as_hal::<wgpu::hal::api::Vulkan>()
+                    .and_then(|i| i.expose_adapter(vk_ctx.physical_device))
+                    .ok_or_else(|| anyhow::anyhow!("Failed to expose VkPhysicalDevice as wgpu adapter"))?
+            };
+            let wgpu_adapter = unsafe {
+                wgpu_instance.create_adapter_from_hal(hal_adapter)
+            };
 
-        log::info!("GPU Features detected:");
-        log::info!("  Indirect drawing: {}", supports_compute);
+            // Check features available on this adapter
+            let adapter_features = wgpu_adapter.features();
+            let supports_compute =
+                adapter_features.contains(wgpu::Features::INDIRECT_FIRST_INSTANCE);
+            let mut features = wgpu::Features::empty();
+            if supports_compute {
+                features |= wgpu::Features::INDIRECT_FIRST_INSTANCE;
+            }
 
-        // Request features if available
-        let mut features = wgpu::Features::empty();
-        if supports_compute {
-            features |= wgpu::Features::INDIRECT_FIRST_INSTANCE;
-            log::info!("  GPU compute culling: ENABLED");
+            // Create the wgpu::Device from the pre-created VkDevice
+            let open_device = unsafe {
+                wgpu_adapter.as_hal::<wgpu::hal::api::Vulkan, _, Result<_, _>>(|hal_adapter| {
+                    hal_adapter
+                        .ok_or_else(|| anyhow::anyhow!("Adapter is not Vulkan"))?
+                        .device_from_raw(
+                            vk_ctx.device,
+                            true, // handle_is_owned (we own the VkDevice)
+                            &vk_ctx.device_extensions,
+                            features,
+                            &wgpu::MemoryHints::default(),
+                            vk_ctx.queue_family_index,
+                            0, // queue_index
+                        )
+                        .map_err(|e| anyhow::anyhow!("device_from_raw failed: {:?}", e))
+                })
+            }
+            .context("Failed to create wgpu device from raw VkDevice")?;
+
+            let (wgpu_device, wgpu_queue) = unsafe {
+                wgpu_adapter.create_device_from_hal(
+                    open_device,
+                    &wgpu::DeviceDescriptor {
+                        label: Some("VR Device"),
+                        required_features: features,
+                        required_limits: wgpu::Limits::default(),
+                        memory_hints: Default::default(),
+                    },
+                    None,
+                )
+            }
+            .map_err(|e| anyhow::anyhow!("create_device_from_hal failed: {}", e))?;
+
+            log::info!("GPU Features detected (VR mode):");
+            log::info!("  Indirect drawing: {}", supports_compute);
+            if supports_compute {
+                log::info!("  GPU compute culling: ENABLED");
+            } else {
+                log::warn!("  GPU compute culling: NOT SUPPORTED - using CPU fallback");
+            }
+
+            (wgpu_instance, wgpu_adapter, wgpu_device, wgpu_queue, Some(vr_session))
         } else {
-            log::warn!("  GPU compute culling: NOT SUPPORTED - using CPU fallback");
-        }
+            // ── Non-VR path: normal wgpu initialization ───────────────────────────
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::PRIMARY,
+                ..Default::default()
+            });
 
-        // Request device and queue
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("Device"),
-                    required_features: features,
-                    required_limits: wgpu::Limits::default(),
-                    memory_hints: Default::default(),
-                },
-                None,
-            )
-            .await?;
+            let surface = instance.create_surface(window.clone())?;
 
-        // Store GPU compute support status
-        let gpu_compute_enabled = supports_compute;
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: Some(&surface),
+                    force_fallback_adapter: false,
+                })
+                .await
+                .ok_or_else(|| anyhow::anyhow!("Failed to find an appropriate adapter"))?;
+
+            let adapter_features = adapter.features();
+            let supports_compute =
+                adapter_features.contains(wgpu::Features::INDIRECT_FIRST_INSTANCE);
+            let mut features = wgpu::Features::empty();
+            if supports_compute {
+                features |= wgpu::Features::INDIRECT_FIRST_INSTANCE;
+            }
+
+            let (device, queue) = adapter
+                .request_device(
+                    &wgpu::DeviceDescriptor {
+                        label: Some("Device"),
+                        required_features: features,
+                        required_limits: wgpu::Limits::default(),
+                        memory_hints: Default::default(),
+                    },
+                    None,
+                )
+                .await?;
+
+            log::info!("GPU Features detected:");
+            log::info!("  Indirect drawing: {}", supports_compute);
+            if supports_compute {
+                log::info!("  GPU compute culling: ENABLED");
+            } else {
+                log::warn!("  GPU compute culling: NOT SUPPORTED - using CPU fallback");
+            }
+
+            (instance, adapter, device, queue, None)
+        };
+
+        // Derive gpu_compute_enabled from the device's actual features
+        let gpu_compute_enabled = device
+            .features()
+            .contains(wgpu::Features::INDIRECT_FIRST_INSTANCE);
+
+        // Create surface (works for both VR and non-VR since the instance has the win32 extension)
+        let surface = instance.create_surface(window.clone())?;
 
         // Configure surface
         let surface_caps = surface.get_capabilities(&adapter);
@@ -378,8 +479,36 @@ impl Renderer {
 
             benchmark_stats: BenchmarkStats::new(),
 
-            vr_renderer: None,
+            vr_renderer: None, // initialized below if vr_mode
+            vr_spheres_renderer: None, // initialized below if vr_mode
         };
+
+        // Initialize VR renderer now that the camera bind group layout is stored in the struct
+        if let Some(vr_session) = initial_vr_session {
+            match crate::vr_renderer::VrRenderer::new(
+                vr_session,
+                &renderer.device,
+                &renderer.camera_bind_group_layout,
+            ) {
+                Ok(vr) => {
+                    log::info!("VR renderer initialized successfully");
+                    // Create VR-specific sphere renderer compiled with the VR swapchain format.
+                    // The desktop sphere renderer uses Bgra8UnormSrgb; VR swapchain uses Rgba8UnormSrgb.
+                    // Using the wrong format causes a pipeline validation error at render time.
+                    let vr_fmt = vr.swapchain_format;
+                    renderer.vr_spheres_renderer = Some(SpheresRenderer::new(
+                        &renderer.device,
+                        vr_fmt,
+                        &renderer.camera_bind_group_layout,
+                    ));
+                    renderer.vr_renderer = Some(vr);
+                }
+                Err(e) => {
+                    log::error!("Failed to initialize VR renderer: {}", e);
+                    return Err(e);
+                }
+            }
+        }
 
         // Initialize benchmark stats
         renderer.benchmark_stats.gpu_enabled = gpu_compute_enabled;
@@ -1017,6 +1146,10 @@ impl Renderer {
         self.spheres_renderer
             .update_instances(&self.queue, &sphere_instances);
 
+        if let Some(ref mut vr_sph) = self.vr_spheres_renderer {
+            vr_sph.update_instances(&self.queue, &sphere_instances);
+        }
+
         // Ball-stick, ribbon, and surface geometries are now lazy-loaded
         // They will be generated when the user switches to those representation modes
         // This significantly speeds up protein loading
@@ -1069,6 +1202,11 @@ impl Renderer {
         self.spheres_medium.update_instances(&self.queue, &sphere_instances);
         self.spheres_low.update_instances(&self.queue, &sphere_instances);
         self.spheres_very_low.update_instances(&self.queue, &sphere_instances);
+
+        // Keep VR sphere renderer in sync (same instances, different pipeline format)
+        if let Some(ref mut vr_sph) = self.vr_spheres_renderer {
+            vr_sph.update_instances(&self.queue, &sphere_instances);
+        }
 
         // TODO: Update Ball-and-Stick, Ribbon, and Surface if loaded
         // For now, animation only works well with Van der Waals representation
