@@ -1312,18 +1312,21 @@ impl ApplicationHandler for App {
 
                                                     // Apply button actions
                                                     if let Some(rt) = repr_choice {
-                                                        // Mirror exactly what the keyboard shortcuts do (keys 1-4):
-                                                        // set renderer.representation + ui_state flags so the
-                                                        // geometry-rebuild path at the bottom of the frame triggers.
-                                                        renderer.representation = rt;
-                                                        self.ui_state.representation = match rt {
+                                                        let ui_rt = match rt {
                                                             RepresentationType::VanDerWaals => UIRepType::VanDerWaals,
                                                             RepresentationType::BallAndStick => UIRepType::BallStick,
                                                             RepresentationType::Ribbon => UIRepType::Ribbon,
                                                             RepresentationType::Surface => UIRepType::Surface,
                                                             _ => UIRepType::VanDerWaals,
                                                         };
+                                                        // The desktop render loop reads model.representation each frame
+                                                        // and overwrites renderer.representation, so we must update both.
+                                                        renderer.representation = rt;
+                                                        self.ui_state.representation = ui_rt;
                                                         self.ui_state.representation_changed = true;
+                                                        for model in self.model_manager.all_models_mut() {
+                                                            model.representation = rt;
+                                                        }
                                                     }
                                                     if do_reset {
                                                         self.vr_mol_position = glam::Vec3::new(0.0, 1.4, -1.5);
