@@ -53,8 +53,14 @@ Renders proteins from PDB files using GPU-accelerated techniques — instanced r
 
 - Full OpenXR 1.0+ integration with stereo rendering (dual render passes)
 - Asymmetric FOV and automatic IPD
-- Controller input (Oculus Touch layout): rotate, translate, teleport, atom selection
-- 3D-space UI panels rendered as world quads
+- **Controller tracking** — coloured spheres mark each hand in real time (blue = left, red = right)
+- **Floating radial menu** — press left grip to open a billboard menu at controller position; press again to close. Menu stays locked at the position where it was opened, freeing the left hand
+- **All 4 representations in VR** — switch between VdW, Ball & Stick, Ribbon and Surface from the VR menu; dedicated VR-format render pipelines ensure correct swapchain format (`Rgba8UnormSrgb`)
+- **Molecule scale** — zoom +/− buttons in the VR menu scale the molecule in world space
+- **Camera reset** — reset button restores the default view
+- **Ray-based pointer** — right controller casts a ray onto the menu quad; accurate billboard-aware UV mapping (projects onto local X/Y axes of the billboard)
+- **Reliable trigger input** — click fires at the last highlighted button position, so slight hand movement while squeezing does not miss the target (threshold: 50% trigger travel)
+- **Atom selection** — right grip ray-picks the nearest atom when the menu is closed
 - Compatible with Quest 2/3, Index, Vive, WMR
 
 ---
@@ -90,7 +96,7 @@ crates/
 └── mol-vr/           # OpenXR VR integration
 ```
 
-**Shaders** (`assets/shaders/`, WGSL format): `sphere.wgsl`, `sphere_indirect.wgsl`, `billboard.wgsl`, `ribbon.wgsl`, `surface.wgsl`, `sphere_raymarch.wgsl`, `surface_raymarch.wgsl`, `axes.wgsl`, plus compute shaders for culling and SDF generation.
+**Shaders** (`assets/shaders/`, WGSL format): `sphere.wgsl`, `sphere_indirect.wgsl`, `billboard.wgsl`, `ribbon.wgsl`, `surface.wgsl`, `sphere_raymarch.wgsl`, `surface_raymarch.wgsl`, `axes.wgsl`, `controller_sphere.wgsl`, plus compute shaders for culling and SDF generation.
 
 ---
 
@@ -142,6 +148,8 @@ Download sample PDB files from [RCSB](https://www.rcsb.org/) (e.g. `9PZW`, `6TAV
 
 ## Controls
 
+### Desktop
+
 | Input | Action |
 |-------|--------|
 | Left mouse drag | Orbit camera |
@@ -151,6 +159,19 @@ Download sample PDB files from [RCSB](https://www.rcsb.org/) (e.g. `9PZW`, `6TAV
 | `R` | Reset camera |
 | `Ctrl`/`Shift` + click | Atom selection |
 | `ESC` | Quit |
+
+### VR (OpenXR)
+
+| Input | Action |
+|-------|--------|
+| Left grip (press) | Open / close floating menu at controller position |
+| Right trigger (aim at button) | Click highlighted menu button |
+| Right grip (menu closed) | Select nearest atom under controller ray |
+| Menu → VdW / Ball+Stick / Ribbon / Surface | Switch molecular representation |
+| Menu → Zoom + / Zoom − | Scale molecule up / down |
+| Menu → Reset | Reset camera to default view |
+
+The floating menu billboards toward the user's head and stays fixed at the position where it was opened. Controller positions are shown as coloured spheres (blue = left, red = right) so you always know where your hands are.
 
 ---
 
@@ -203,7 +224,7 @@ Surface generation for 9PZW:
 - [x] GPU indirect draw
 - [x] Rayon parallelism (SDF, bond inference)
 - [x] Multi-frame animation (MODEL/ENDMDL)
-- [x] OpenXR VR support (stereo, controllers, 3D UI)
+- [x] OpenXR VR support (stereo, controllers, billboard menu, representation switching, scale, atom selection)
 - [x] Raymarched sphere & surface representations
 - [x] Axes renderer
 - [ ] Multiple color schemes (by chain, residue, hydrophobicity)

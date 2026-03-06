@@ -43,7 +43,10 @@ struct App {
     vr_menu_world_pos: glam::Vec3,
     /// UV coordinates (0-1) where the right controller ray hits the menu quad.
     vr_menu_pointer_uv: Option<glam::Vec2>,
-    /// True for one frame when right trigger crosses 0.8 threshold.
+    /// Last valid UV while hovering — retained so a trigger click uses it even
+    /// if the hand moves slightly when squeezing.
+    vr_last_hover_uv: Option<glam::Vec2>,
+    /// True for one frame when right trigger crosses 0.5 threshold.
     vr_menu_trigger_click: bool,
     vr_prev_trigger: f32,
     /// egui context used exclusively for the VR floating menu.
@@ -105,6 +108,7 @@ impl App {
             vr_prev_left_grip: false,
             vr_menu_world_pos: glam::Vec3::new(0.0, 1.2, -0.5),
             vr_menu_pointer_uv: None,
+            vr_last_hover_uv: None,
             vr_menu_trigger_click: false,
             vr_prev_trigger: 0.0,
             vr_egui_ctx: egui::Context::default(),
@@ -1091,9 +1095,9 @@ impl ApplicationHandler for App {
                                     }
                                     self.vr_prev_left_grip = left_grip;
 
-                                    // Right trigger (edge at 0.8) → click on menu or nothing
+                                    // Right trigger (edge at 0.5) → click on menu
                                     let trig = cs.right_trigger_value;
-                                    self.vr_menu_trigger_click = trig > 0.8 && self.vr_prev_trigger <= 0.8;
+                                    self.vr_menu_trigger_click = trig > 0.5 && self.vr_prev_trigger <= 0.5;
                                     self.vr_prev_trigger = trig;
 
                                     // Compute controller ray → menu UV intersection (right controller)
@@ -1101,26 +1105,38 @@ impl ApplicationHandler for App {
                                         use glam::Vec3;
                                         let ray_origin = cs.right_pose.position;
                                         let ray_dir = mol_vr::VrInput::get_controller_forward(&cs.right_pose);
-                                        // Menu quad follows left controller; normal faces roughly toward origin (+Z in stage)
                                         let menu_center = self.vr_menu_world_pos;
-                                        let menu_normal = Vec3::new(0.0, 0.0, 1.0);
+                                        // Use the same billboard rotation as the render transform
+                                        let to_head = (self.vr_head_pos - menu_center).normalize();
+                                        let menu_rot = if to_head.length_squared() > 0.0001 {
+                                            glam::Quat::from_rotation_arc(Vec3::Z, to_head)
+                                        } else {
+                                            glam::Quat::IDENTITY
+                                        };
+                                        let menu_normal = menu_rot * Vec3::Z; // = to_head
+                                        let menu_right  = menu_rot * Vec3::X;
+                                        let menu_up     = menu_rot * Vec3::Y;
                                         let denom = menu_normal.dot(ray_dir);
                                         if denom.abs() > 0.001 {
                                             let t = menu_normal.dot(menu_center - ray_origin) / denom;
                                             if t > 0.0 {
                                                 let hit = ray_origin + ray_dir * t;
                                                 let local = hit - menu_center;
-                                                let u = (local.x / 0.6 + 0.5).clamp(0.0, 1.0);
-                                                let v = (0.5 - local.y / 0.3).clamp(0.0, 1.0);
-                                                self.vr_menu_pointer_uv = Some(glam::Vec2::new(u, v));
+                                                let u = (local.dot(menu_right) / 0.6 + 0.5).clamp(0.0, 1.0);
+                                                let v = (0.5 - local.dot(menu_up) / 0.3).clamp(0.0, 1.0);
+                                                let uv = glam::Vec2::new(u, v);
+                                                self.vr_menu_pointer_uv = Some(uv);
+                                                self.vr_last_hover_uv   = Some(uv); // retain for click
                                             } else {
                                                 self.vr_menu_pointer_uv = None;
+                                                // keep vr_last_hover_uv so click still fires at last position
                                             }
                                         } else {
                                             self.vr_menu_pointer_uv = None;
                                         }
                                     } else {
                                         self.vr_menu_pointer_uv = None;
+                                        self.vr_last_hover_uv   = None; // menu closed, reset
                                     }
 
                                     // Right grip (edge) → pick atom when menu is closed
@@ -1258,13 +1274,26 @@ impl ApplicationHandler for App {
                                                         ..Default::default()
                                                     };
                                                     self.vr_egui_ctx.set_pixels_per_point(px);
+                                                    // Inject current hover position (moves the cursor)
                                                     if let Some(uv) = self.vr_menu_pointer_uv {
                                                         let ppos = egui::Pos2::new(
                                                             uv.x * screen_w as f32 / px,
                                                             uv.y * screen_h as f32 / px,
                                                         );
                                                         raw.events.push(egui::Event::PointerMoved(ppos));
-                                                        if self.vr_menu_trigger_click {
+                                                    }
+                                                    // On trigger click use the LAST known hover UV so a slight
+                                                    // hand movement while squeezing doesn't miss the button.
+                                                    if self.vr_menu_trigger_click {
+                                                        let click_uv = self.vr_menu_pointer_uv
+                                                            .or(self.vr_last_hover_uv);
+                                                        if let Some(uv) = click_uv {
+                                                            let ppos = egui::Pos2::new(
+                                                                uv.x * screen_w as f32 / px,
+                                                                uv.y * screen_h as f32 / px,
+                                                            );
+                                                            // Move cursor to click position, then press + release
+                                                            raw.events.push(egui::Event::PointerMoved(ppos));
                                                             raw.events.push(egui::Event::PointerButton { pos: ppos, button: egui::PointerButton::Primary, pressed: true,  modifiers: Default::default() });
                                                             raw.events.push(egui::Event::PointerButton { pos: ppos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
                                                         }
@@ -1292,7 +1321,9 @@ impl ApplicationHandler for App {
                                                                     ("Surface",   RepresentationType::Surface),
                                                                 ];
                                                                 for (label, rt) in &opts {
-                                                                    if ui.selectable_label(cur_repr == *rt, *label).clicked() {
+                                                                    let selected = cur_repr == *rt;
+                                                                    if ui.add(egui::Button::new(*label)
+                                                                        .selected(selected)).clicked() {
                                                                         repr_choice = Some(*rt);
                                                                     }
                                                                 }
