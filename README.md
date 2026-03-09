@@ -146,6 +146,195 @@ Download sample PDB files from [RCSB](https://www.rcsb.org/) (e.g. `9PZW`, `6TAV
 
 ---
 
+## Molecular Dynamics Integration (Python / OpenMM)
+
+PDB Visual includes Python scripts for building membrane systems, running MD simulations with OpenMM, and streaming atom positions in real time to the viewer.
+
+### Installation — conda
+
+```bash
+# Create a dedicated environment (recommended)
+conda create -n molviewer python=3.11
+conda activate molviewer
+
+# OpenMM + scientific stack
+conda install -c conda-forge openmm numpy scipy
+
+# Optional: for clash detection in audit_structure()
+conda install -c conda-forge scipy
+```
+
+Verify OpenMM is working:
+
+```bash
+python -c "import openmm; print(openmm.__version__)"
+python -m openmm.testInstallation
+```
+
+---
+
+### Live Streaming — `scripts/openmm_mdss.py`
+
+`MDSSReporter` is an OpenMM reporter that streams atom coordinates to PDB Visual in real time over TCP using the MDSS protocol. Every N integration steps, positions are sent to the viewer and rendered immediately.
+
+#### Quickstart
+
+**1. Start the viewer** in live-stream mode pointing at your PDB file:
+
+```bash
+# Windows
+target\release\mol-app.exe --live-stream 7777 protein.pdb
+
+# Linux / macOS
+./target/release/mol-app --live-stream 7777 protein.pdb
+```
+
+**2. Run your simulation** using `MDSSReporter`:
+
+```python
+from scripts.openmm_mdss import MDSSReporter
+from openmm.app import *
+from openmm import *
+from openmm.unit import *
+
+pdb      = PDBFile("protein.pdb")
+ff       = ForceField("amber14-all.xml", "amber14/tip3pfb.xml")
+system   = ff.createSystem(pdb.topology, nonbondedMethod=PME,
+                            nonbondedCutoff=1.0*nanometer, constraints=HBonds)
+integrator = LangevinMiddleIntegrator(300*kelvin, 1/picosecond, 0.002*picoseconds)
+
+simulation = Simulation(pdb.topology, system, integrator)
+simulation.context.setPositions(pdb.positions)
+simulation.minimizeEnergy()
+
+# Stream every 10 steps to PDB Visual (viewer must already be running)
+simulation.reporters.append(MDSSReporter(reportInterval=10, port=7777))
+simulation.step(10000)
+```
+
+Or let the reporter launch the viewer automatically:
+
+```python
+simulation.reporters.append(MDSSReporter(
+    reportInterval=10,
+    pdb_path="protein.pdb",
+    launch_viewer=True,
+    viewer_exe="target/release/mol-app",
+    port=7777,
+))
+```
+
+#### MDSS Protocol
+
+```
+Handshake (client → server):  "MDSS" + u32 version=1
+Handshake (server → client):  "MDSS" + u32 version=1 + u32 ok=1
+Per frame:                     u32 frame_num + u32 n_atoms + n_atoms×3×f32 + u32 checksum
+End sentinel:                  u32 0 + u32 0
+```
+
+Positions are sent in Ångströms (converted from OpenMM's nanometers).
+
+---
+
+### Structure Audit — `audit_structure()`
+
+Before running a simulation, call `audit_structure()` to detect common problems that would cause the simulation to crash or produce nonsense results.
+
+```python
+from scripts.openmm_mdss import audit_structure
+from openmm.app import PDBFile
+
+pdb = PDBFile("protein.pdb")
+issues, warnings = audit_structure(pdb.topology, pdb.positions)
+
+for w in warnings:
+    print(f"[WARN]  {w}")
+for e in issues:
+    print(f"[ERROR] {e}")
+```
+
+What it checks:
+
+| Check | Severity |
+|-------|----------|
+| Unknown residues (not protein/nucleic/water/ion) | Warning |
+| NaN or Inf coordinates | Error |
+| Severe atomic clashes (atoms < 0.5 Å apart, `scipy` required) | Warning |
+
+---
+
+### Membrane Builder — `scripts/create_membrane.py`
+
+Builds lipid bilayer membranes using a built-in coarse-grained 5-bead force field (inspired by MARTINI 2, no extra packages beyond OpenMM + NumPy). For production quality, it also accepts CHARMM-GUI output.
+
+#### Supported lipids
+
+```
+POPC  POPE  POPS  POPG  POPA    DPPC  DPPE  DPPS  DPPG  DPPA
+DOPC  DOPE  DOPS  DOPG  DOPA    DLPC  DLPE  DLPS  DLPG
+DSPC  DSPE  DSPS  DSPG  DSPA    CHOL
+```
+
+```bash
+# List all supported lipids with area-per-lipid estimates
+python scripts/create_membrane.py --list-lipids
+```
+
+#### Usage examples
+
+```bash
+# Pure POPC bilayer, save to PDB (no equilibration)
+python scripts/create_membrane.py --lipids POPC:100 --no-equilibrate --output popc.pdb
+
+# Plasma membrane-like mixed bilayer — stream to the viewer
+python scripts/create_membrane.py \
+    --lipids POPC:40:POPE:30:CHOL:20:POPS:10 \
+    --size 100 100 --salt 0.15 --stream \
+    --viewer-exe target/release/mol-app
+
+# Custom box, temperature, longer production run
+python scripts/create_membrane.py \
+    --lipids DPPC:100 \
+    --size 120 120 --water 30 --temperature 323 \
+    --production-time 120 --output dppc_323K.pdb
+
+# Load CHARMM-GUI all-atom system (production quality)
+python scripts/create_membrane.py \
+    --charmm-psf step5_input.psf --charmm-pdb step5_input.pdb \
+    --stream --viewer-exe target/release/mol-app
+```
+
+#### All options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--lipids LIPID:N[:LIPID:N]` | `POPC:100` | Composition per leaflet |
+| `--size X Y` | `80 80` | Box XY dimensions in Å |
+| `--water Å` | `25` | Water layer thickness per side in Å |
+| `--salt M` | `0.15` | NaCl concentration in mol/L |
+| `--temperature K` | `310` | Simulation temperature in K |
+| `--no-equilibrate` | off | Skip minimization + heating |
+| `--output FILE` | `membrane.pdb` | Output PDB path |
+| `--workdir DIR` | `membrane_build` | Working directory for intermediates |
+| `--stream` | off | Stream frames to PDB Visual via MDSS |
+| `--port N` | `7777` | MDSS TCP port |
+| `--viewer-exe PATH` | `pdbvisual` | Path to the viewer executable |
+| `--production-time s` | `60` | Wall-clock seconds for production run |
+| `--charmm-psf FILE` | — | CHARMM-GUI PSF file (all-atom mode) |
+| `--charmm-pdb FILE` | — | CHARMM-GUI PDB file (required with PSF) |
+| `--charmm-ff FILE…` | — | Extra CHARMM FF files (`.xml`/`.prm`/`.str`) |
+
+#### CG model details
+
+- **5-bead model**: `P` (headgroup) → `O1` (glycerol) → `C1` → `C2` → `CT` (tail end)
+- **CHOL**: 4-bead model (`O1 → C1 → C2 → CT`, no glycerol bead)
+- TIP3P water + NaCl ions at the specified salt concentration
+- Equilibration: energy minimization → gradual heating (50 K → target T in 6 stages)
+- PBC not used in CG mode (non-periodic cutoff); CHARMM-GUI mode uses PME
+
+---
+
 ## Controls
 
 ### Desktop
@@ -230,6 +419,8 @@ Surface generation for 9PZW:
 - [ ] Multiple color schemes (by chain, residue, hydrophobicity)
 - [ ] Distance and angle measurements
 - [ ] PNG / OBJ / STL export
+- [x] OpenMM live-streaming via MDSS reporter (`scripts/openmm_mdss.py`)
+- [x] Lipid membrane builder with CG force field (`scripts/create_membrane.py`)
 - [ ] DCD / XTC trajectory formats
 - [ ] Per-frame bond recomputation for Ball&Stick animation
 
